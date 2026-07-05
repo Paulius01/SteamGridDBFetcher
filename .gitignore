@@ -49,3 +49,7 @@ eagle.epf
 
 # file locks introduced since 7.x
 *.lck
+
+# SteamGridDB Fetcher
+backups/
+config.json
