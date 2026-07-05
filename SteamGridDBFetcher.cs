@@ -23,6 +23,7 @@ using System.Linq;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
@@ -338,6 +339,46 @@ namespace SteamGridDBFetcher
             return 0;
         }
 
+        // Alternative search terms for shortcut names that don't match as-is:
+        // separators to spaces, CamelCase split, letter/digit split, and
+        // stripped noise suffixes ("Ver1", "Steam", ...).
+        public static List<string> AltTerms(string name)
+        {
+            var alts = new List<string>();
+            Action<string> add = delegate(string s)
+            {
+                s = Regex.Replace(s, @"\s+", " ").Trim();
+                if (s.Length > 1 &&
+                    !string.Equals(s, name, StringComparison.OrdinalIgnoreCase) &&
+                    !alts.Contains(s, StringComparer.OrdinalIgnoreCase))
+                    alts.Add(s);
+            };
+            string spaced = Regex.Replace(name, @"[_\-\.]+", " ");
+            add(spaced);
+            string camel = Regex.Replace(spaced, @"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ");
+            add(camel);
+            string digits = Regex.Replace(camel, @"(?<=[A-Za-z])(?=\d)", " ");
+            add(digits);
+            string noise = Regex.Replace(digits, @"\s+(steam|pc|en|eng|jp)$", "", RegexOptions.IgnoreCase);
+            noise = Regex.Replace(noise, @"\s+v(er)?\.?\s*\d+$", "", RegexOptions.IgnoreCase);
+            add(noise);
+            return alts;
+        }
+
+        // Search, retrying with smarter variants of the term when nothing is
+        // found. Returns the term that worked together with its results.
+        public async Task<KeyValuePair<string, List<SgdbGame>>> SearchSmart(string term)
+        {
+            var res = await Search(term);
+            if (res.Count > 0) return new KeyValuePair<string, List<SgdbGame>>(term, res);
+            foreach (string alt in AltTerms(term))
+            {
+                res = await Search(alt);
+                if (res.Count > 0) return new KeyValuePair<string, List<SgdbGame>>(alt, res);
+            }
+            return new KeyValuePair<string, List<SgdbGame>>(term, new List<SgdbGame>());
+        }
+
         public async Task<List<SgdbGame>> Search(string term)
         {
             var data = await GetData(Base + "/search/autocomplete/" + Uri.EscapeDataString(term));
@@ -410,6 +451,18 @@ namespace SteamGridDBFetcher
             { "background", new string[] { "library_hero_2x.jpg", "library_hero.jpg" } },
             { "logo",       new string[] { "logo_2x.png", "logo.png" } },
         };
+
+        // The always-present (non-2x) variant, used for preview thumbnails.
+        public static string PreviewFile(string key)
+        {
+            string[] f = Files[key];
+            return f[f.Length - 1];
+        }
+
+        public static string PreviewUrl(int steamId, string key)
+        {
+            return "https://cdn.cloudflare.steamstatic.com/steam/apps/" + steamId + "/" + PreviewFile(key);
+        }
 
         // Apply the official Steam default for one asset type. False if unavailable.
         public static async Task<bool> Apply(string gdir, uint appid, AType t, int steamId, string stamp)
@@ -1092,9 +1145,21 @@ namespace SteamGridDBFetcher
             ShowPlaceholder("Searching SteamGridDB...");
             SetStatus("Searching \"" + term + "\"...", DIM);
             List<SgdbGame> results;
-            try { results = await api.Search(term); }
+            string usedTerm;
+            try
+            {
+                var smart = await api.SearchSmart(term);
+                usedTerm = smart.Key;
+                results = smart.Value;
+            }
             catch (Exception ex) { SetStatus("Search failed: " + ex.Message, ERRC); return; }
             if (g != gen) return;
+
+            if (results.Count > 0 && usedTerm != term)
+            {
+                searchBox.Text = usedTerm;   // show the term that actually matched
+                term = usedTerm;
+            }
 
             matches.Clear();
             matches.AddRange(results);
@@ -1158,6 +1223,15 @@ namespace SteamGridDBFetcher
             }
             UpdateFlowWidths();
             SetStatus("Loading assets for " + gameName + "...", DIM);
+
+            // offer the game's original Steam assets as picks, like auto mode uses
+            int steamId = 0;
+            try { steamId = await api.SteamAppId(gameId); }
+            catch (Exception) { }
+            if (g != gen) return;
+            if (steamId > 0)
+                foreach (AType t in Cfg.Types)
+                    AddOfficialTile(t, flows[t.Key], steamId, g);
 
             foreach (AType t in Cfg.Types)
             {
@@ -1244,6 +1318,47 @@ namespace SteamGridDBFetcher
             SelectTile(key, p, null);
         }
 
+        // The game's original Steam asset, selectable like any other pick.
+        // Only appears when the file actually exists on Steam's CDN.
+        async void AddOfficialTile(AType t, FlowLayoutPanel flow, int steamId, int g)
+        {
+            byte[] data;
+            try { data = await Sgdb.Download(SteamStore.PreviewUrl(steamId, t.Key)); }
+            catch (Exception) { return; }   // no official asset of this type
+            if (g != gen || flow.IsDisposed) return;
+            Image img;
+            try { img = Image.FromStream(new MemoryStream(data)); }
+            catch (Exception) { return; }
+
+            string selUrl = "official:" + steamId;
+            var p = new Panel
+            {
+                Size = new Size(t.W + 10, t.H + 10), BackColor = PANEL,
+                Margin = new Padding(4), Tag = selUrl
+            };
+            var pb = new PictureBox
+            {
+                Location = new Point(5, 5), Size = new Size(t.W, t.H - 16),
+                SizeMode = PictureBoxSizeMode.Zoom, BackColor = FIELD,
+                Cursor = Cursors.Hand, Image = img
+            };
+            var caption = new Label
+            {
+                Text = "Steam default", ForeColor = OKC, BackColor = FIELD,
+                Font = new Font("Segoe UI", 7.5f),
+                Location = new Point(5, 5 + t.H - 16), Size = new Size(t.W, 16),
+                TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand
+            };
+            p.Controls.Add(pb);
+            p.Controls.Add(caption);
+            string key = t.Key;
+            EventHandler h = delegate { SelectTile(key, p, selUrl); };
+            p.Click += h; pb.Click += h; caption.Click += h;
+            flow.Controls.Add(p);
+            flow.Controls.SetChildIndex(p, 1);   // right after the "current" tile
+            tiles[key].Add(p);
+        }
+
         Panel AddAssetTile(AType t, FlowLayoutPanel flow, string url)
         {
             var p = new Panel
@@ -1314,7 +1429,14 @@ namespace SteamGridDBFetcher
                 foreach (var kv in sel.ToList())
                 {
                     AType t = Cfg.Types.First(x => x.Key == kv.Key);
-                    written.Add(await Artwork.Apply(gridDir, game.AppId, t, kv.Value, stamp));
+                    if (kv.Value.StartsWith("official:"))
+                    {
+                        int sid = int.Parse(kv.Value.Substring("official:".Length));
+                        if (await SteamStore.Apply(gridDir, game.AppId, t, sid, stamp))
+                            written.Add(t.Key + " (Steam default)");
+                    }
+                    else
+                        written.Add(await Artwork.Apply(gridDir, game.AppId, t, kv.Value, stamp));
                 }
                 MarkApplied(game.AppId);
                 SetStatus("Applied: " + string.Join(", ", written) +
@@ -1379,7 +1501,7 @@ namespace SteamGridDBFetcher
                     bool wrote = false;
 
                     List<SgdbGame> res = null;
-                    try { res = await api.Search(sc.Name); }
+                    try { res = (await api.SearchSmart(sc.Name)).Value; }
                     catch (Exception) { }
                     if (res != null && res.Count > 0)
                     {
