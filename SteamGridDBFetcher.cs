@@ -633,6 +633,8 @@ namespace SteamGridDBFetcher
             ClientSize = new Size(1280, 840);
             MinimumSize = new Size(1000, 640);
             StartPosition = FormStartPosition.CenterScreen;
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+            catch (Exception) { }
 
             BuildUi();
             Shown += OnShownAsync;
