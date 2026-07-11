@@ -38,6 +38,7 @@ namespace SteamGridDBFetcher
     {
         public uint AppId;
         public string Name;
+        public bool IsSteam;   // installed Steam-store game (not a shortcut)
     }
 
     class SgdbGame
@@ -254,6 +255,52 @@ namespace SteamGridDBFetcher
             int n;
             return int.TryParse(kv.Key, out n) ? n : 0;
         }
+
+        // Installed Steam-store games, from appmanifest_*.acf across all
+        // Steam library folders. Read-only.
+        public static List<Shortcut> LoadSteamGames(string steamPath)
+        {
+            var games = new List<Shortcut>();
+            var seen = new HashSet<uint>();
+            var libs = new List<string> { steamPath };
+            try
+            {
+                string lf = Path.Combine(steamPath, "steamapps", "libraryfolders.vdf");
+                if (File.Exists(lf))
+                    foreach (Match m in Regex.Matches(File.ReadAllText(lf), "\"path\"\\s+\"([^\"]+)\""))
+                        libs.Add(m.Groups[1].Value.Replace("\\\\", "\\"));
+            }
+            catch (Exception) { }
+
+            foreach (string lib in libs.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                string sa = Path.Combine(lib, "steamapps");
+                if (!Directory.Exists(sa)) continue;
+                string[] acfs;
+                try { acfs = Directory.GetFiles(sa, "appmanifest_*.acf"); }
+                catch (Exception) { continue; }
+                foreach (string acf in acfs)
+                {
+                    try
+                    {
+                        string txt = File.ReadAllText(acf);
+                        Match ma = Regex.Match(txt, "\"appid\"\\s+\"(\\d+)\"");
+                        Match mn = Regex.Match(txt, "\"name\"\\s+\"([^\"]+)\"");
+                        if (!ma.Success || !mn.Success) continue;
+                        uint id = uint.Parse(ma.Groups[1].Value);
+                        string name = mn.Groups[1].Value;
+                        if (id == 228980 || name.IndexOf("Redistributable", StringComparison.OrdinalIgnoreCase) >= 0
+                            || name.StartsWith("Steamworks", StringComparison.OrdinalIgnoreCase))
+                            continue;   // runtime/redist entries, not games
+                        if (seen.Add(id))
+                            games.Add(new Shortcut { AppId = id, Name = name, IsSteam = true });
+                    }
+                    catch (Exception) { }
+                }
+            }
+            games.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+            return games;
+        }
     }
 
     // ------------------------------------------------------- SteamGridDB API
@@ -452,27 +499,37 @@ namespace SteamGridDBFetcher
             { "logo",       new string[] { "logo_2x.png", "logo.png" } },
         };
 
-        // The always-present (non-2x) variant, used for preview thumbnails.
-        public static string PreviewFile(string key)
+        // Valve serves official art from two CDN layouts; newer titles often
+        // exist only on the second one.
+        public static readonly string[] CdnBases = new string[]
+        {
+            "https://cdn.cloudflare.steamstatic.com/steam/apps/",
+            "https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/",
+        };
+
+        // Preview candidates (always-present non-2x variant, on each CDN).
+        public static List<string> PreviewUrls(int steamId, string key)
         {
             string[] f = Files[key];
-            return f[f.Length - 1];
-        }
-
-        public static string PreviewUrl(int steamId, string key)
-        {
-            return "https://cdn.cloudflare.steamstatic.com/steam/apps/" + steamId + "/" + PreviewFile(key);
+            string file = f[f.Length - 1];
+            var list = new List<string>();
+            foreach (string cdn in CdnBases) list.Add(cdn + steamId + "/" + file);
+            return list;
         }
 
         // Apply the official Steam default for one asset type. False if unavailable.
         public static async Task<bool> Apply(string gdir, uint appid, AType t, int steamId, string stamp)
         {
             foreach (string f in Files[t.Key])
-            {
-                string url = "https://cdn.cloudflare.steamstatic.com/steam/apps/" + steamId + "/" + f;
-                try { await Artwork.Apply(gdir, appid, t, url, stamp); return true; }
-                catch (Exception) { }
-            }
+                foreach (string cdn in CdnBases)
+                {
+                    try
+                    {
+                        await Artwork.Apply(gdir, appid, t, cdn + steamId + "/" + f, stamp);
+                        return true;
+                    }
+                    catch (Exception) { }
+                }
             return false;
         }
     }
@@ -590,10 +647,20 @@ namespace SteamGridDBFetcher
         Panel libraryView;
         FlowLayoutPanel libraryFlow;
         Label profileLabel;
-        Button autoAllBtn;
+        Button autoAllBtn, refreshBtn, filterBtn;
+        TextBox filterBox;
+        CheckBox steamBox;
+        List<Shortcut> steamGames = new List<Shortcut>();
+        int libGen;   // invalidates in-flight Steam cover downloads on rebuild
         readonly Dictionary<uint, GameTile> gameTiles = new Dictionary<uint, GameTile>();
         readonly Dictionary<uint, Image> coverImages = new Dictionary<uint, Image>();
         readonly Dictionary<uint, Image> placeholders = new Dictionary<uint, Image>();
+        readonly Dictionary<uint, Image> steamCoverCache = new Dictionary<uint, Image>();
+
+        IEnumerable<Shortcut> DisplayGames
+        {
+            get { return steamGames.Count > 0 ? shortcuts.Concat(steamGames) : (IEnumerable<Shortcut>)shortcuts; }
+        }
 
         // picker view
         Panel pickerView;
@@ -617,7 +684,7 @@ namespace SteamGridDBFetcher
         Shortcut currentShortcut;
         int gen;                 // invalidates in-flight loads
         int currentSgdbId = -1;
-        bool busy, suppressMatch;
+        bool busy, suppressMatch, suppressSteamBox;
 
         [DllImport("dwmapi.dll")]
         static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
@@ -697,13 +764,12 @@ namespace SteamGridDBFetcher
                 api = new Sgdb(key.Trim());
 
                 steamPath = Steam.FindPath(cfg);
-                shortcuts = Steam.LoadShortcuts(steamPath, Cfg.Str(cfg, "user_id"), out userId);
-                gridDir = Artwork.GridDir(steamPath, userId);
                 stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
 
-                foreach (Shortcut sc in shortcuts) LoadCoverImage(sc.AppId);
-                BuildLibrary();
-                UpdateProfileLabel();
+                suppressSteamBox = true;
+                steamBox.Checked = Cfg.Int(cfg, "show_steam", 0) == 1;
+                suppressSteamBox = false;
+                ReloadLibrary();
                 UpdateButtons();   // enables Auto-apply ALL right away
                 SetStatus("Ready. Click a game to pick its artwork.", DIM);
             }
@@ -764,7 +830,7 @@ namespace SteamGridDBFetcher
                 Cursor = Cursors.Hand,
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                Padding = new Padding(10, 4, 10, 4)
+                Padding = new Padding(14, 7, 14, 7)
             };
             b.FlatAppearance.BorderSize = 0;
             b.FlatAppearance.MouseOverBackColor = accent ? ColorTranslator.FromHtml("#8ad0f8") : PANEL;
@@ -805,13 +871,55 @@ namespace SteamGridDBFetcher
             };
             topBar.Controls.Add(profileLabel);
 
+            var tools = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Right, AutoSize = true, WrapContents = false,
+                FlowDirection = FlowDirection.LeftToRight, BackColor = PANEL,
+                Padding = new Padding(0, 15, 12, 0)
+            };
+            topBar.Controls.Add(tools);
+
+            steamBox = new CheckBox
+            {
+                Text = "Show Steam games", ForeColor = TX, BackColor = PANEL,
+                AutoSize = true, Margin = new Padding(0, 8, 12, 0), Cursor = Cursors.Hand
+            };
+            steamBox.CheckedChanged += delegate
+            {
+                if (suppressSteamBox) return;
+                cfg["show_steam"] = steamBox.Checked ? 1 : 0;
+                Cfg.Save(cfg);
+                RefreshLibrary();
+            };
+            tools.Controls.Add(steamBox);
+
+            filterBox = new TextBox
+            {
+                Width = 210, BackColor = FIELD, ForeColor = TX,
+                BorderStyle = BorderStyle.FixedSingle, Font = new Font("Segoe UI", 10f),
+                Margin = new Padding(0, 5, 8, 0)
+            };
+            filterBox.TextChanged += delegate { ApplyFilter(); };
+            filterBox.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; ApplyFilter(); }
+            };
+            tools.Controls.Add(filterBox);
+
+            filterBtn = MakeButton("Search", false);
+            filterBtn.Margin = new Padding(0, 0, 8, 0);
+            filterBtn.Click += delegate { ApplyFilter(); };
+            tools.Controls.Add(filterBtn);
+
+            refreshBtn = MakeButton("Refresh", false);
+            refreshBtn.Margin = new Padding(0, 0, 8, 0);
+            refreshBtn.Click += delegate { RefreshLibrary(); };
+            tools.Controls.Add(refreshBtn);
+
             autoAllBtn = MakeButton("Auto-apply ALL games", false);
-            autoAllBtn.AutoSize = false;
-            autoAllBtn.Size = new Size(190, 34);
-            autoAllBtn.Location = new Point(topBar.Width - 210, 15);
-            autoAllBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            autoAllBtn.Margin = new Padding(0);
             autoAllBtn.Click += delegate { AutoAll(); };
-            topBar.Controls.Add(autoAllBtn);
+            tools.Controls.Add(autoAllBtn);
 
             libraryFlow = new BareFlowPanel
             {
@@ -827,8 +935,6 @@ namespace SteamGridDBFetcher
             pickerView.BringToFront();
 
             backBtn = MakeButton("<   Library", false);
-            backBtn.AutoSize = false;
-            backBtn.Size = new Size(120, 34);
             backBtn.Location = new Point(16, 14);
             backBtn.Click += delegate { BackToLibrary(); };
             pickerView.Controls.Add(backBtn);
@@ -843,7 +949,7 @@ namespace SteamGridDBFetcher
 
             searchBox = new TextBox
             {
-                Location = new Point(16, 58), Size = new Size(pickerView.Width - 140, 26),
+                Location = new Point(16, 58), Size = new Size(pickerView.Width - 160, 26),
                 Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
                 BackColor = FIELD, ForeColor = TX, BorderStyle = BorderStyle.FixedSingle,
                 Font = new Font("Segoe UI", 10f)
@@ -856,8 +962,8 @@ namespace SteamGridDBFetcher
 
             searchBtn = MakeButton("Search", true);
             searchBtn.AutoSize = false;
-            searchBtn.Size = new Size(100, 32);
-            searchBtn.Location = new Point(pickerView.Width - 118, 55);
+            searchBtn.Size = new Size(120, 36);
+            searchBtn.Location = new Point(pickerView.Width - 138, 54);
             searchBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             searchBtn.Click += delegate { DoSearch(); };
             pickerView.Controls.Add(searchBtn);
@@ -938,6 +1044,7 @@ namespace SteamGridDBFetcher
             applyBtn.Enabled = !busy && sel.Count > 0;
             autoBtn.Enabled = !busy && currentSgdbId > 0;
             autoAllBtn.Enabled = !busy && shortcuts != null;
+            refreshBtn.Enabled = !busy && shortcuts != null;
             searchBtn.Enabled = !busy;
             backBtn.Enabled = !busy;
             matchCombo.Enabled = !busy;
@@ -945,6 +1052,19 @@ namespace SteamGridDBFetcher
         }
 
         // ------------------------------------------------- library (grid) view
+
+        static Bitmap ScaleCover(Image src)
+        {
+            var bmp = new Bitmap(CoverW, CoverH);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                float scale = Math.Max((float)CoverW / src.Width, (float)CoverH / src.Height);
+                float sw = src.Width * scale, sh = src.Height * scale;
+                g.DrawImage(src, (CoverW - sw) / 2f, (CoverH - sh) / 2f, sw, sh);
+            }
+            return bmp;
+        }
 
         void LoadCoverImage(uint appid)
         {
@@ -957,19 +1077,106 @@ namespace SteamGridDBFetcher
             {
                 byte[] bytes = File.ReadAllBytes(p);   // read bytes so the file isn't locked
                 using (var src = Image.FromStream(new MemoryStream(bytes)))
-                {
-                    var bmp = new Bitmap(CoverW, CoverH);
-                    using (var g = Graphics.FromImage(bmp))
-                    {
-                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                        float scale = Math.Max((float)CoverW / src.Width, (float)CoverH / src.Height);
-                        float sw = src.Width * scale, sh = src.Height * scale;
-                        g.DrawImage(src, (CoverW - sw) / 2f, (CoverH - sh) / 2f, sw, sh);
-                    }
-                    coverImages[appid] = bmp;
-                }
+                    coverImages[appid] = ScaleCover(src);
             }
             catch (Exception) { }
+        }
+
+        // Fetch a Steam-store game's own library cover from the CDN in the
+        // background (session-cached), so store games show their real art.
+        void QueueSteamCover(Shortcut sc)
+        {
+            if (steamCoverCache.ContainsKey(sc.AppId)) return;
+            int g = libGen;
+            uint appid = sc.AppId;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                Bitmap bmp = null;
+                try
+                {
+                    byte[] data = null;
+
+                    // Steam's local library cache first: it's exactly the art
+                    // Steam itself shows, works offline, and covers titles the
+                    // public CDNs are missing.
+                    string cache = Path.Combine(steamPath, "appcache", "librarycache");
+                    var local = new List<string>
+                    {
+                        Path.Combine(cache, appid + "_library_600x900.jpg"),
+                        Path.Combine(cache, appid.ToString(), "library_600x900.jpg"),
+                    };
+                    try
+                    {
+                        string sub = Path.Combine(cache, appid.ToString());
+                        if (Directory.Exists(sub))
+                            local.AddRange(Directory.GetFiles(sub, "library_600x900*"));
+                    }
+                    catch (Exception) { }
+                    foreach (string lc in local)
+                        if (File.Exists(lc))
+                        {
+                            try { data = File.ReadAllBytes(lc); break; }
+                            catch (Exception) { }
+                        }
+
+                    // Newer Steam cache layout: librarycache/{appid}/{hash}/
+                    // subfolders, each holding a properly named image. Search
+                    // recursively; some titles (demos) only have the store
+                    // capsule instead of a library capsule.
+                    if (data == null)
+                    {
+                        try
+                        {
+                            string sub = Path.Combine(cache, appid.ToString());
+                            if (Directory.Exists(sub))
+                                foreach (string pattern in new string[]
+                                         { "library_600x900*", "library_capsule.*", "capsule*" })
+                                {
+                                    string[] found = Directory.GetFiles(sub, pattern,
+                                                                        SearchOption.AllDirectories);
+                                    if (found.Length > 0)
+                                    {
+                                        data = File.ReadAllBytes(found[0]);
+                                        break;
+                                    }
+                                }
+                        }
+                        catch (Exception) { }
+                    }
+
+                    if (data == null)
+                        foreach (string cdn in SteamStore.CdnBases)
+                        {
+                            try
+                            {
+                                using (var wc = new WebClient())
+                                {
+                                    wc.Headers["User-Agent"] = "SteamGridDBFetcher/1.0";
+                                    data = wc.DownloadData(cdn + appid + "/library_600x900.jpg");
+                                }
+                                break;
+                            }
+                            catch (Exception) { }
+                        }
+
+                    if (data == null) return;
+                    using (var src = Image.FromStream(new MemoryStream(data)))
+                        bmp = ScaleCover(src);
+                }
+                catch (Exception) { return; }
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (steamCoverCache.ContainsKey(appid)) { bmp.Dispose(); return; }
+                        steamCoverCache[appid] = bmp;
+                        if (g != libGen) return;
+                        Shortcut cur = DisplayGames.FirstOrDefault(x => x.AppId == appid);
+                        if (cur != null) UpdateTile(cur);
+                    });
+                }
+                catch (Exception) { bmp.Dispose(); }   // window closed
+            });
         }
 
         Image GetPlaceholder(Shortcut sc)
@@ -993,10 +1200,65 @@ namespace SteamGridDBFetcher
             return bmp;
         }
 
+        // Re-reads shortcuts.vdf (and installed Steam games when enabled)
+        // from disk and rebuilds the whole grid.
+        void ReloadLibrary()
+        {
+            libGen++;
+            shortcuts = Steam.LoadShortcuts(steamPath, Cfg.Str(cfg, "user_id"), out userId);
+            steamGames = steamBox.Checked ? Steam.LoadSteamGames(steamPath) : new List<Shortcut>();
+            gridDir = Artwork.GridDir(steamPath, userId);
+
+            var old = libraryFlow.Controls.Cast<Control>().ToList();
+            libraryFlow.Controls.Clear();
+            foreach (Control c in old) c.Dispose();
+            gameTiles.Clear();
+            foreach (Image img in coverImages.Values) img.Dispose();
+            coverImages.Clear();
+            foreach (Image img in placeholders.Values) img.Dispose();
+            placeholders.Clear();
+
+            foreach (Shortcut sc in DisplayGames)
+            {
+                LoadCoverImage(sc.AppId);
+                if (sc.IsSteam && !coverImages.ContainsKey(sc.AppId))
+                    QueueSteamCover(sc);   // show Steam's own cover for store games
+            }
+            BuildLibrary();
+            UpdateProfileLabel();
+            ApplyFilter();
+        }
+
+        void RefreshLibrary()
+        {
+            if (busy) return;
+            try
+            {
+                ReloadLibrary();
+                SetStatus("Refreshed - " + shortcuts.Count + " games. (If a just-added " +
+                          "shortcut is missing, restart Steam: it can hold shortcuts.vdf " +
+                          "in memory until it exits.)", OKC);
+            }
+            catch (Exception ex) { SetStatus("Refresh failed: " + ex.Message, ERRC); }
+        }
+
+        void ApplyFilter()
+        {
+            if (shortcuts == null || filterBox == null) return;
+            string f = filterBox.Text.Trim();
+            foreach (Shortcut sc in DisplayGames)
+            {
+                GameTile t;
+                if (gameTiles.TryGetValue(sc.AppId, out t))
+                    t.Root.Visible = f.Length == 0 ||
+                        sc.Name.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+        }
+
         void BuildLibrary()
         {
             libraryFlow.SuspendLayout();
-            foreach (Shortcut sc in shortcuts)
+            foreach (Shortcut sc in DisplayGames)
             {
                 var tile = new GameTile();
                 tile.Root = new Panel
@@ -1052,11 +1314,13 @@ namespace SteamGridDBFetcher
             GameTile t;
             if (!gameTiles.TryGetValue(sc.AppId, out t)) return;
             Image cover;
-            coverImages.TryGetValue(sc.AppId, out cover);
+            if (!coverImages.TryGetValue(sc.AppId, out cover) && sc.IsSteam)
+                steamCoverCache.TryGetValue(sc.AppId, out cover);
             t.Pic.Image = cover != null ? cover : GetPlaceholder(sc);
             bool isApplied = applied.Contains(sc.AppId);
             t.Name.ForeColor = isApplied ? OKC : TX;
             if (isApplied) { t.Status.Text = "updated"; t.Status.ForeColor = OKC; }
+            else if (sc.IsSteam) { t.Status.Text = "Steam"; t.Status.ForeColor = DIM; }
             else if (cover == null) { t.Status.Text = "missing artwork"; t.Status.ForeColor = WARN; }
             else { t.Status.Text = ""; }
         }
@@ -1066,13 +1330,14 @@ namespace SteamGridDBFetcher
             if (shortcuts == null) return;
             int missing = shortcuts.Count(sc => !coverImages.ContainsKey(sc.AppId));
             profileLabel.Text = "Profile " + userId + "   -   " + shortcuts.Count + " non-Steam games"
+                + (steamGames.Count > 0 ? " + " + steamGames.Count + " Steam games" : "")
                 + (missing > 0 ? "   -   " + missing + " without cover art" : "   -   all covered");
         }
 
         void RefreshGame(uint appid)
         {
             LoadCoverImage(appid);
-            Shortcut sc = shortcuts.FirstOrDefault(x => x.AppId == appid);
+            Shortcut sc = DisplayGames.FirstOrDefault(x => x.AppId == appid);
             if (sc != null) UpdateTile(sc);
             UpdateProfileLabel();
         }
@@ -1324,9 +1589,13 @@ namespace SteamGridDBFetcher
         // Only appears when the file actually exists on Steam's CDN.
         async void AddOfficialTile(AType t, FlowLayoutPanel flow, int steamId, int g)
         {
-            byte[] data;
-            try { data = await Sgdb.Download(SteamStore.PreviewUrl(steamId, t.Key)); }
-            catch (Exception) { return; }   // no official asset of this type
+            byte[] data = null;
+            foreach (string u in SteamStore.PreviewUrls(steamId, t.Key))
+            {
+                try { data = await Sgdb.Download(u); break; }
+                catch (Exception) { }
+            }
+            if (data == null) return;   // no official asset of this type
             if (g != gen || flow.IsDisposed) return;
             Image img;
             try { img = Image.FromStream(new MemoryStream(data)); }
@@ -1480,10 +1749,21 @@ namespace SteamGridDBFetcher
         async void AutoAll()
         {
             if (busy || api == null || shortcuts == null) return;
+            // only what the list is actually showing right now: the Steam
+            // toggle and the search filter both narrow the scope
+            var targets = DisplayGames.Where(sc =>
+            {
+                GameTile t;
+                return gameTiles.TryGetValue(sc.AppId, out t) && t.Root.Visible;
+            }).ToList();
+            if (targets.Count == 0) return;
+
             DialogResult r = MessageBox.Show(this,
-                "Fill in missing artwork for all " + shortcuts.Count + " games?\n\n" +
+                "Fill in missing artwork for the " + targets.Count + " game(s) currently " +
+                "shown in the list?\n\n" +
                 "Empty slots get the official Steam default art (SteamGridDB top result " +
-                "if the game isn't on Steam).\n\nArtwork you already have is never touched.",
+                "if the game isn't on Steam).\n\nArtwork you already have is never touched; " +
+                "games hidden by the search box or the Steam toggle are not touched either.",
                 "Auto-apply all", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             if (r != DialogResult.Yes) return;
 
@@ -1492,13 +1772,13 @@ namespace SteamGridDBFetcher
             int updated = 0, complete = 0, notFound = 0;
             try
             {
-                for (int i = 0; i < shortcuts.Count; i++)
+                for (int i = 0; i < targets.Count; i++)
                 {
-                    Shortcut sc = shortcuts[i];
+                    Shortcut sc = targets[i];
                     var missing = Cfg.Types.Where(t => FindExisting(sc.AppId, t.Suffix) == null).ToList();
                     if (missing.Count == 0) { complete++; continue; }
 
-                    SetStatus("[" + (i + 1) + "/" + shortcuts.Count + "] " + sc.Name +
+                    SetStatus("[" + (i + 1) + "/" + targets.Count + "] " + sc.Name +
                               "  (" + missing.Count + " empty slot(s))...", DIM);
                     bool wrote = false;
 

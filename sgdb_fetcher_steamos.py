@@ -44,7 +44,12 @@ CONFIG_PATH = SCRIPT_DIR / "config_steamos.json"
 BACKUP_DIR = SCRIPT_DIR / "backups"
 
 SGDB_API = "https://www.steamgriddb.com/api/v2"
-STEAM_CDN = "https://cdn.cloudflare.steamstatic.com/steam/apps/"
+# Valve serves official art from two CDN layouts; newer titles often exist
+# only on the second one.
+CDN_BASES = (
+    "https://cdn.cloudflare.steamstatic.com/steam/apps/",
+    "https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/",
+)
 
 # key, endpoint, query params, grid-file suffix, label
 TYPES = [
@@ -344,10 +349,11 @@ def apply_asset(gdir, appid, type_key, url, stamp):
 def apply_official(gdir, appid, type_key, steam_id, stamp):
     """Apply the official Steam default (best quality variant that exists)."""
     for f in STEAM_FILES[type_key]:
-        try:
-            return apply_asset(gdir, appid, type_key, STEAM_CDN + "%d/%s" % (steam_id, f), stamp)
-        except Exception:
-            continue
+        for cdn in CDN_BASES:
+            try:
+                return apply_asset(gdir, appid, type_key, cdn + "%d/%s" % (steam_id, f), stamp)
+            except Exception:
+                continue
     return None
 
 
@@ -616,8 +622,8 @@ async function loadAssets(gameId) {
       row.insertAdjacentHTML('beforeend', `
         <div class="pick c-${k}" data-t="${k}" data-v="official:${steamId}" onclick="choose(this)"
              id="off-${k}">
-          <img src="${officialUrl(k, steamId)}"
-               onerror="document.getElementById('off-${k}').remove()">
+          <img src="${officialUrl(k, steamId, 0)}"
+               onerror="offErr(this, '${k}', ${steamId})">
           <div class="cap off">Steam default</div></div>`);
     }
   }
@@ -643,10 +649,16 @@ async function loadAssets(gameId) {
   if (g === gen) status('Assets loaded. Click thumbnails to change picks, then Apply.', 'ok');
 }
 
-function officialUrl(k, sid) {
+const CDN_BASES = ['https://cdn.cloudflare.steamstatic.com/steam/apps/',
+                   'https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/'];
+function officialUrl(k, sid, i) {
   const f = {cover:'library_600x900.jpg', wide:'header.jpg',
              background:'library_hero.jpg', logo:'logo.png'}[k];
-  return 'https://cdn.cloudflare.steamstatic.com/steam/apps/' + sid + '/' + f;
+  return CDN_BASES[i] + sid + '/' + f;
+}
+function offErr(img, k, sid) {
+  if (!img.dataset.alt) { img.dataset.alt = '1'; img.src = officialUrl(k, sid, 1); }
+  else { const p = img.closest('.pick'); if (p) p.remove(); }
 }
 
 function choose(el) {
