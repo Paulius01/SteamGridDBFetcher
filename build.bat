@@ -6,5 +6,8 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:winexe ^
   /out:SteamGridDBFetcher.exe /win32icon:app.ico ^
   /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll ^
   /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll ^
+  /reference:System.Xaml.dll ^
+  /reference:"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\WindowsBase.dll" ^
+  /reference:"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\PresentationCore.dll" ^
   SteamGridDBFetcher.cs
 if errorlevel 1 (echo BUILD FAILED & pause) else echo Built SteamGridDBFetcher.exe

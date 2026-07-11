@@ -51,6 +51,13 @@ namespace SteamGridDBFetcher
     {
         public string Url;
         public string Thumb;
+        public string Mime;
+    }
+
+    class AssetPage
+    {
+        public List<SgdbAsset> Assets = new List<SgdbAsset>();
+        public int Total;
     }
 
     class AType
@@ -63,14 +70,13 @@ namespace SteamGridDBFetcher
     {
         public static readonly AType[] Types = new AType[]
         {
-            new AType { Key = "cover",      Endpoint = "grids",  Query = "?dimensions=600x900",         Suffix = "p",     Label = "Cover (600x900)",      W = 220, H = 330 },
-            new AType { Key = "wide",       Endpoint = "grids",  Query = "?dimensions=920x430,460x215", Suffix = "",      Label = "Wide Cover (920x430)", W = 430, H = 201 },
-            new AType { Key = "background", Endpoint = "heroes", Query = "",                            Suffix = "_hero", Label = "Background (hero)",    W = 480, H = 155 },
-            new AType { Key = "logo",       Endpoint = "logos",  Query = "",                            Suffix = "_logo", Label = "Logo",                 W = 300, H = 150 },
+            new AType { Key = "cover",      Endpoint = "grids",  Query = "?dimensions=600x900&types=static,animated",         Suffix = "p",     Label = "Cover (600x900)",      W = 220, H = 330 },
+            new AType { Key = "wide",       Endpoint = "grids",  Query = "?dimensions=920x430,460x215&types=static,animated", Suffix = "",      Label = "Wide Cover (920x430)", W = 430, H = 201 },
+            new AType { Key = "background", Endpoint = "heroes", Query = "?types=static,animated",                            Suffix = "_hero", Label = "Background (hero)",    W = 480, H = 155 },
+            new AType { Key = "logo",       Endpoint = "logos",  Query = "?types=static,animated",                            Suffix = "_logo", Label = "Logo",                 W = 300, H = 150 },
         };
 
         public static readonly string[] ImageExts = new string[] { ".png", ".jpg", ".jpeg", ".webp" };
-        public const int MaxThumbs = 21;
 
         public static string ExeDir { get { return Path.GetDirectoryName(Application.ExecutablePath); } }
         public static string ConfigPath { get { return Path.Combine(ExeDir, "config.json"); } }
@@ -315,14 +321,14 @@ namespace SteamGridDBFetcher
 
         public Sgdb(string apiKey) { key = apiKey; }
 
-        // Returns the "data" value of an API response: object[] for lists,
-        // Dictionary for single objects, null on 404.
-        async Task<object> GetRaw(string url)
+        // Returns the whole (successful) response body as a dictionary,
+        // null on 404 / failure. Cached per URL.
+        async Task<Dictionary<string, object>> GetJson(string url)
         {
             lock (cacheLock)
             {
                 object hit;
-                if (cache.TryGetValue(url, out hit)) return hit;
+                if (cache.TryGetValue(url, out hit)) return (Dictionary<string, object>)hit;
             }
             string body;
             try
@@ -343,17 +349,25 @@ namespace SteamGridDBFetcher
                     throw new Exception("SteamGridDB rejected the API key (401). Fix it in config.json.");
                 else throw;
             }
-            object data = null;
+            Dictionary<string, object> root = null;
             if (body != null)
             {
-                var root = Js.DeserializeObject(body) as Dictionary<string, object>;
-                object ok, d;
-                if (root != null && root.TryGetValue("success", out ok) && ok is bool && (bool)ok
-                    && root.TryGetValue("data", out d))
-                    data = d;
+                root = Js.DeserializeObject(body) as Dictionary<string, object>;
+                object ok;
+                if (root != null && root.TryGetValue("success", out ok) && ok is bool && !(bool)ok)
+                    root = null;
             }
-            lock (cacheLock) { cache[url] = data; }
-            return data;
+            lock (cacheLock) { cache[url] = root; }
+            return root;
+        }
+
+        // The "data" value of a response: object[] for lists, Dictionary for
+        // single objects, null on 404.
+        async Task<object> GetRaw(string url)
+        {
+            var root = await GetJson(url);
+            object d;
+            return root != null && root.TryGetValue("data", out d) ? d : null;
         }
 
         async Task<object[]> GetData(string url)
@@ -448,21 +462,39 @@ namespace SteamGridDBFetcher
             {
                 var a = o as Dictionary<string, object>;
                 if (a == null) continue;
-                object url, thumb;
+                object url, thumb, mime;
                 if (!a.TryGetValue("url", out url)) continue;
                 a.TryGetValue("thumb", out thumb);
+                a.TryGetValue("mime", out mime);
                 list.Add(new SgdbAsset
                 {
                     Url = Convert.ToString(url),
-                    Thumb = thumb != null ? Convert.ToString(thumb) : Convert.ToString(url)
+                    Thumb = thumb != null ? Convert.ToString(thumb) : Convert.ToString(url),
+                    Mime = mime != null ? Convert.ToString(mime) : null
                 });
             }
             return list;
         }
 
+        // One page (50) of assets plus the server's total count.
+        public async Task<AssetPage> AssetsPaged(int gameId, AType t, int page)
+        {
+            var root = await GetJson(Base + "/" + t.Endpoint + "/game/" + gameId + t.Query
+                                     + "&page=" + page);
+            var res = new AssetPage();
+            if (root != null)
+            {
+                object d, tot;
+                if (root.TryGetValue("data", out d) && d is object[])
+                    res.Assets = ParseAssets((object[])d);
+                res.Total = root.TryGetValue("total", out tot) ? Convert.ToInt32(tot) : res.Assets.Count;
+            }
+            return res;
+        }
+
         public async Task<List<SgdbAsset>> Assets(int gameId, AType t)
         {
-            return ParseAssets(await GetData(Base + "/" + t.Endpoint + "/game/" + gameId + t.Query));
+            return (await AssetsPaged(gameId, t, 0)).Assets;
         }
 
         // Official (Steam-mirrored) logos; the API only supports styles=official
@@ -675,6 +707,9 @@ namespace SteamGridDBFetcher
 
         readonly Dictionary<string, FlowLayoutPanel> flows = new Dictionary<string, FlowLayoutPanel>();
         readonly Dictionary<string, Label> countLabels = new Dictionary<string, Label>();
+        readonly Dictionary<string, int> pageByType = new Dictionary<string, int>();
+        readonly Dictionary<string, int> totalByType = new Dictionary<string, int>();
+        readonly Dictionary<string, int> shownByType = new Dictionary<string, int>();
         readonly Dictionary<string, List<Panel>> tiles = new Dictionary<string, List<Panel>>();
         readonly Dictionary<string, string> sel = new Dictionary<string, string>();
         readonly HashSet<uint> applied = new HashSet<uint>();
@@ -1500,10 +1535,13 @@ namespace SteamGridDBFetcher
                 foreach (AType t in Cfg.Types)
                     AddOfficialTile(t, flows[t.Key], steamId, g);
 
+            pageByType.Clear();
+            totalByType.Clear();
+            shownByType.Clear();
             foreach (AType t in Cfg.Types)
             {
-                List<SgdbAsset> assets;
-                try { assets = await api.Assets(gameId, t); }
+                AssetPage pg;
+                try { pg = await api.AssetsPaged(gameId, t, 0); }
                 catch (Exception ex)
                 {
                     if (g == gen) countLabels[t.Key].Text = "failed to load (" + ex.Message + ")";
@@ -1511,18 +1549,22 @@ namespace SteamGridDBFetcher
                 }
                 if (g != gen) return;
 
-                int n = Math.Min(assets.Count, Cfg.MaxThumbs);
-                countLabels[t.Key].Text = assets.Count == 0
+                pageByType[t.Key] = 0;
+                totalByType[t.Key] = pg.Total;
+                shownByType[t.Key] = pg.Assets.Count;
+                countLabels[t.Key].Text = pg.Total == 0
                     ? "none available on SteamGridDB"
-                    : assets.Count + " found - click to pick";
+                    : pg.Total + " available - click to pick";
 
-                for (int i = 0; i < n; i++)
+                for (int i = 0; i < pg.Assets.Count; i++)
                 {
-                    Panel tile = AddAssetTile(t, flows[t.Key], assets[i].Url);
+                    Panel tile = AddAssetTile(t, flows[t.Key], pg.Assets[i]);
                     // default pick: keep existing art if there is any, else top result
-                    if (i == 0 && !hasExisting[t.Key]) SelectTile(t.Key, tile, assets[i].Url);
-                    LoadThumb((PictureBox)tile.Controls[0], assets[i].Thumb, g);
+                    if (i == 0 && !hasExisting[t.Key]) SelectTile(t.Key, tile, pg.Assets[i].Url);
+                    LoadThumb((PictureBox)tile.Controls[0], pg.Assets[i].Thumb, g);
                 }
+                if (shownByType[t.Key] < pg.Total)
+                    AddLoadMoreTile(t, g);
             }
             if (g == gen)
                 SetStatus("Assets loaded. Click thumbnails to change picks, then Apply selected.", OKC);
@@ -1630,8 +1672,13 @@ namespace SteamGridDBFetcher
             tiles[key].Add(p);
         }
 
-        Panel AddAssetTile(AType t, FlowLayoutPanel flow, string url)
+        Panel AddAssetTile(AType t, FlowLayoutPanel flow, SgdbAsset a)
         {
+            string url = a.Url;
+            bool animated = a.Mime != null &&
+                (a.Mime.IndexOf("webp", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 a.Mime.IndexOf("apng", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 a.Mime.IndexOf("gif", StringComparison.OrdinalIgnoreCase) >= 0);
             var p = new Panel
             {
                 Size = new Size(t.W + 10, t.H + 10), BackColor = PANEL,
@@ -1639,16 +1686,72 @@ namespace SteamGridDBFetcher
             };
             var pb = new PictureBox
             {
-                Location = new Point(5, 5), Size = new Size(t.W, t.H),
+                Location = new Point(5, 5), Size = new Size(t.W, animated ? t.H - 16 : t.H),
                 SizeMode = PictureBoxSizeMode.Zoom, BackColor = FIELD, Cursor = Cursors.Hand
             };
             p.Controls.Add(pb);
             string key = t.Key;
             EventHandler h = delegate { SelectTile(key, p, url); };
             p.Click += h; pb.Click += h;
+            if (animated)
+            {
+                var cap = new Label
+                {
+                    Text = "animated", ForeColor = ACC, BackColor = FIELD,
+                    Font = new Font("Segoe UI", 7.5f),
+                    Location = new Point(5, 5 + t.H - 16), Size = new Size(t.W, 16),
+                    TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand
+                };
+                p.Controls.Add(cap);
+                cap.Click += h;
+            }
             flow.Controls.Add(p);
             tiles[key].Add(p);
             return p;
+        }
+
+        // "Load more" tile at the end of a row when the server has more pages.
+        void AddLoadMoreTile(AType t, int g)
+        {
+            int remaining = totalByType[t.Key] - shownByType[t.Key];
+            var p = new Panel
+            {
+                Size = new Size(t.W + 10, t.H + 10), BackColor = PANEL2,
+                Margin = new Padding(4), Cursor = Cursors.Hand
+            };
+            var lbl = new Label
+            {
+                Text = "Load more\n(" + remaining + " left)", ForeColor = ACC, BackColor = PANEL2,
+                Location = new Point(5, 5), Size = new Size(t.W, t.H),
+                TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+            };
+            p.Controls.Add(lbl);
+            EventHandler h = delegate { LoadMore(t, p, lbl, g); };
+            p.Click += h; lbl.Click += h;
+            flows[t.Key].Controls.Add(p);
+        }
+
+        async void LoadMore(AType t, Panel tile, Label lbl, int g)
+        {
+            if (g != gen || currentSgdbId <= 0) return;
+            lbl.Text = "loading...";
+            AssetPage pg;
+            try { pg = await api.AssetsPaged(currentSgdbId, t, pageByType[t.Key] + 1); }
+            catch (Exception) { lbl.Text = "failed -\nclick to retry"; return; }
+            if (g != gen) return;
+            pageByType[t.Key]++;
+            var flow = flows[t.Key];
+            flow.Controls.Remove(tile);
+            tile.Dispose();
+            foreach (SgdbAsset a in pg.Assets)
+            {
+                Panel tp = AddAssetTile(t, flow, a);
+                LoadThumb((PictureBox)tp.Controls[0], a.Thumb, g);
+            }
+            shownByType[t.Key] += pg.Assets.Count;
+            if (pg.Assets.Count > 0 && shownByType[t.Key] < totalByType[t.Key])
+                AddLoadMoreTile(t, g);
         }
 
         async void LoadThumb(PictureBox pb, string thumbUrl, int g)
@@ -1664,7 +1767,45 @@ namespace SteamGridDBFetcher
             finally { thumbSem.Release(); }
             if (g != gen || pb.IsDisposed) return;
             try { pb.Image = Image.FromStream(new MemoryStream(data)); }
-            catch (Exception) { }  // undecodable format -> leave blank tile
+            catch (Exception)
+            {
+                // GDI+ can't decode WebP; try WIC (uses the Windows WebP codec
+                // when installed), else show a labeled placeholder.
+                Image wic = WicDecode(data);
+                pb.Image = wic != null ? wic : TextThumb(pb.Width, pb.Height);
+            }
+        }
+
+        static Image WicDecode(byte[] data)
+        {
+            try
+            {
+                var frame = System.Windows.Media.Imaging.BitmapFrame.Create(
+                    new MemoryStream(data),
+                    System.Windows.Media.Imaging.BitmapCreateOptions.None,
+                    System.Windows.Media.Imaging.BitmapCacheOption.OnLoad);
+                var enc = new System.Windows.Media.Imaging.PngBitmapEncoder();
+                enc.Frames.Add(frame);
+                using (var ms = new MemoryStream())
+                {
+                    enc.Save(ms);
+                    return Image.FromStream(new MemoryStream(ms.ToArray()));
+                }
+            }
+            catch (Exception) { return null; }
+        }
+
+        static Image TextThumb(int w, int h)
+        {
+            var bmp = new Bitmap(Math.Max(16, w), Math.Max(16, h));
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.Clear(FIELD);
+                TextRenderer.DrawText(g, "animated\n(no preview)", new Font("Segoe UI", 8f),
+                    new Rectangle(0, 0, bmp.Width, bmp.Height), DIM,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            }
+            return bmp;
         }
 
         void SelectTile(string typeKey, Panel tile, string url)

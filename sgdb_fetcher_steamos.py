@@ -53,10 +53,10 @@ CDN_BASES = (
 
 # key, endpoint, query params, grid-file suffix, label
 TYPES = [
-    ("cover",      "grids",  {"dimensions": "600x900"},         "p",     "Cover (600x900)"),
-    ("wide",       "grids",  {"dimensions": "920x430,460x215"}, "",      "Wide Cover (920x430)"),
-    ("background", "heroes", {},                                "_hero", "Background (hero)"),
-    ("logo",       "logos",  {},                                "_logo", "Logo"),
+    ("cover",      "grids",  {"dimensions": "600x900", "types": "static,animated"},         "p",     "Cover (600x900)"),
+    ("wide",       "grids",  {"dimensions": "920x430,460x215", "types": "static,animated"}, "",      "Wide Cover (920x430)"),
+    ("background", "heroes", {"types": "static,animated"},                                  "_hero", "Background (hero)"),
+    ("logo",       "logos",  {"types": "static,animated"},                                  "_logo", "Logo"),
 ]
 TYPE_BY_KEY = {t[0]: t for t in TYPES}
 
@@ -635,7 +635,7 @@ async function loadAssets(gameId) {
     if (g !== gen) return;
     $('#cnt-' + k).textContent = assets.length ? assets.length + ' found - click to pick' : 'none available on SteamGridDB';
     const row = $('#row-' + k);
-    for (const a of assets.slice(0, 21)) {
+    for (const a of assets) {
       row.insertAdjacentHTML('beforeend', `
         <div class="pick c-${k}" data-t="${k}" data-v="${esc(a.url)}" onclick="choose(this)">
           <img loading="lazy" src="${esc(a.thumb)}"><div class="cap"></div></div>`);
