@@ -278,8 +278,12 @@ class Sgdb:
     def assets(self, game_id, type_key):
         _, endpoint, params, _, _ = TYPE_BY_KEY[type_key]
         q = ("?" + urllib.parse.urlencode(params)) if params else ""
-        return [{"url": a["url"], "thumb": a.get("thumb") or a["url"]}
-                for a in self._list("/%s/game/%d%s" % (endpoint, game_id, q))]
+        out = []
+        for a in self._list("/%s/game/%d%s" % (endpoint, game_id, q)):
+            thumb = a.get("thumb") or a["url"]
+            out.append({"url": a["url"], "thumb": thumb,
+                        "animated": str(thumb).endswith(".webm")})
+        return out
 
     def official_logos(self, game_id):
         try:
@@ -471,16 +475,16 @@ PAGE = r"""<!DOCTYPE html>
   .pick { border:3px solid var(--panel); border-radius:5px; background:var(--panel);
           cursor:pointer; position:relative; overflow:hidden; }
   .pick.sel { border-color:var(--acc); box-shadow:0 0 10px #66c0f466; }
-  .pick img { display:block; background:var(--field); object-fit:cover; }
+  .pick img, .pick video { display:block; background:var(--field); object-fit:cover; }
   .pick .cap { position:absolute; left:0; right:0; bottom:0; background:#0e1117d9; font-size:10px;
                text-align:center; padding:2px 0; }
   .cap.cur { color:var(--acc); } .cap.off { color:var(--ok); } .cap.none { color:var(--warn); }
   .pick .empty { display:flex; align-items:center; justify-content:center; color:var(--dim);
                  background:var(--field); font-size:12px; }
-  .c-cover img, .c-cover .empty { width:160px; height:240px; }
-  .c-wide img, .c-wide .empty { width:320px; height:150px; }
-  .c-background img, .c-background .empty { width:360px; height:116px; }
-  .c-logo img, .c-logo .empty { width:220px; height:110px; object-fit:contain; }
+  .c-cover img, .c-cover video, .c-cover .empty { width:160px; height:240px; }
+  .c-wide img, .c-wide video, .c-wide .empty { width:320px; height:150px; }
+  .c-background img, .c-background video, .c-background .empty { width:360px; height:116px; }
+  .c-logo img, .c-logo video, .c-logo .empty { width:220px; height:110px; object-fit:contain; }
   #status { position:fixed; left:0; right:0; bottom:0; background:var(--field); color:var(--dim);
             padding:9px 20px; font-size:12px; border-top:1px solid #000a; }
   #status.ok { color:var(--ok); } #status.err { color:var(--err); }
@@ -636,9 +640,11 @@ async function loadAssets(gameId) {
     $('#cnt-' + k).textContent = assets.length ? assets.length + ' found - click to pick' : 'none available on SteamGridDB';
     const row = $('#row-' + k);
     for (const a of assets) {
+      const media = a.animated
+        ? `<video autoplay loop muted playsinline src="${esc(a.thumb)}"></video>`
+        : `<img loading="lazy" src="${esc(a.thumb)}">`;
       row.insertAdjacentHTML('beforeend', `
-        <div class="pick c-${k}" data-t="${k}" data-v="${esc(a.url)}" onclick="choose(this)">
-          <img loading="lazy" src="${esc(a.thumb)}"><div class="cap"></div></div>`);
+        <div class="pick c-${k}" data-t="${k}" data-v="${esc(a.url)}" onclick="choose(this)">${media}</div>`);
     }
     // default: keep existing if present, else preselect the top result
     if (!(await api('/api/existing?appid=' + cur.appid))[k] && assets.length) {

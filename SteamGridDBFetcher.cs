@@ -52,6 +52,7 @@ namespace SteamGridDBFetcher
         public string Url;
         public string Thumb;
         public string Mime;
+        public bool Animated;
     }
 
     class AssetPage
@@ -466,11 +467,18 @@ namespace SteamGridDBFetcher
                 if (!a.TryGetValue("url", out url)) continue;
                 a.TryGetValue("thumb", out thumb);
                 a.TryGetValue("mime", out mime);
+                string thumbStr = thumb != null ? Convert.ToString(thumb) : Convert.ToString(url);
+                string mimeStr = mime != null ? Convert.ToString(mime) : null;
                 list.Add(new SgdbAsset
                 {
                     Url = Convert.ToString(url),
-                    Thumb = thumb != null ? Convert.ToString(thumb) : Convert.ToString(url),
-                    Mime = mime != null ? Convert.ToString(mime) : null
+                    Thumb = thumbStr,
+                    Mime = mimeStr,
+                    // SGDB gives animated assets a .webm video as "thumb"
+                    Animated = thumbStr.EndsWith(".webm", StringComparison.OrdinalIgnoreCase)
+                        || (mimeStr != null &&
+                            (mimeStr.IndexOf("apng", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             mimeStr.IndexOf("gif", StringComparison.OrdinalIgnoreCase) >= 0))
                 });
             }
             return list;
@@ -1059,6 +1067,10 @@ namespace SteamGridDBFetcher
             contentPanel.Controls.Add(sectionsFlow);
             contentPanel.Resize += delegate { UpdateFlowWidths(); };
 
+            var animTimer = new System.Windows.Forms.Timer { Interval = 30 };
+            animTimer.Tick += delegate { AnimTick(); };
+            animTimer.Start();
+
             UpdateButtons();
         }
 
@@ -1561,7 +1573,7 @@ namespace SteamGridDBFetcher
                     Panel tile = AddAssetTile(t, flows[t.Key], pg.Assets[i]);
                     // default pick: keep existing art if there is any, else top result
                     if (i == 0 && !hasExisting[t.Key]) SelectTile(t.Key, tile, pg.Assets[i].Url);
-                    LoadThumb((PictureBox)tile.Controls[0], pg.Assets[i].Thumb, g);
+                    LoadThumb((PictureBox)tile.Controls[0], pg.Assets[i], g);
                 }
                 if (shownByType[t.Key] < pg.Total)
                     AddLoadMoreTile(t, g);
@@ -1675,10 +1687,7 @@ namespace SteamGridDBFetcher
         Panel AddAssetTile(AType t, FlowLayoutPanel flow, SgdbAsset a)
         {
             string url = a.Url;
-            bool animated = a.Mime != null &&
-                (a.Mime.IndexOf("webp", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                 a.Mime.IndexOf("apng", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                 a.Mime.IndexOf("gif", StringComparison.OrdinalIgnoreCase) >= 0);
+            bool animated = a.Animated;
             var p = new Panel
             {
                 Size = new Size(t.W + 10, t.H + 10), BackColor = PANEL,
@@ -1747,30 +1756,152 @@ namespace SteamGridDBFetcher
             foreach (SgdbAsset a in pg.Assets)
             {
                 Panel tp = AddAssetTile(t, flow, a);
-                LoadThumb((PictureBox)tp.Controls[0], a.Thumb, g);
+                LoadThumb((PictureBox)tp.Controls[0], a, g);
             }
             shownByType[t.Key] += pg.Assets.Count;
             if (pg.Assets.Count > 0 && shownByType[t.Key] < totalByType[t.Key])
                 AddLoadMoreTile(t, g);
         }
 
-        async void LoadThumb(PictureBox pb, string thumbUrl, int g)
+        // ---------------------------------------------- animated previews
+
+        class AnimClip
         {
+            public readonly List<Image> Frames = new List<Image>();
+            public readonly List<int> Delays = new List<int>();
+
+            public void Dispose()
+            {
+                foreach (Image f in Frames) f.Dispose();
+                Frames.Clear();
+            }
+        }
+
+        class AnimEntry
+        {
+            public PictureBox Pb;
+            public AnimClip Clip;
+            public int Idx;
+            public int NextAt;
+        }
+
+        readonly List<AnimEntry> anims = new List<AnimEntry>();
+
+        void AnimTick()
+        {
+            int now = Environment.TickCount;
+            for (int i = anims.Count - 1; i >= 0; i--)
+            {
+                AnimEntry a = anims[i];
+                if (a.Pb.IsDisposed)
+                {
+                    anims.RemoveAt(i);
+                    a.Clip.Dispose();
+                    continue;
+                }
+                if (now - a.NextAt >= 0)
+                {
+                    a.Idx = (a.Idx + 1) % a.Clip.Frames.Count;
+                    a.Pb.Image = a.Clip.Frames[a.Idx];
+                    a.NextAt = now + a.Clip.Delays[a.Idx];
+                }
+            }
+        }
+
+        // Decode an animated webp/apng/gif into downscaled frames + delays
+        // via WIC. Returns null when the format can't be decoded.
+        static AnimClip DecodeClip(byte[] data, int maxW, int maxH)
+        {
+            try
+            {
+                var dec = System.Windows.Media.Imaging.BitmapDecoder.Create(
+                    new MemoryStream(data),
+                    System.Windows.Media.Imaging.BitmapCreateOptions.None,
+                    System.Windows.Media.Imaging.BitmapCacheOption.OnLoad);
+                int total = dec.Frames.Count;
+                if (total == 0) return null;
+                int step = Math.Max(1, (total + 23) / 24);   // keep <= 24 frames
+                var clip = new AnimClip();
+                for (int i = 0; i < total; i += step)
+                {
+                    var frame = dec.Frames[i];
+                    System.Windows.Media.Imaging.BitmapSource src = frame;
+                    double scale = Math.Min(1.0, Math.Min(
+                        (double)maxW / frame.PixelWidth, (double)maxH / frame.PixelHeight));
+                    if (scale < 1.0)
+                        src = new System.Windows.Media.Imaging.TransformedBitmap(
+                            frame, new System.Windows.Media.ScaleTransform(scale, scale));
+                    var enc = new System.Windows.Media.Imaging.PngBitmapEncoder();
+                    enc.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(src));
+                    using (var ms = new MemoryStream())
+                    {
+                        enc.Save(ms);
+                        clip.Frames.Add(Image.FromStream(new MemoryStream(ms.ToArray())));
+                    }
+                    int delay = 70;
+                    try
+                    {
+                        var md = frame.Metadata as System.Windows.Media.Imaging.BitmapMetadata;
+                        if (md != null)
+                        {
+                            object q = md.GetQuery("/ANMF/FrameDuration");
+                            if (q != null) delay = Math.Max(20, Convert.ToInt32(q));
+                        }
+                    }
+                    catch (Exception) { }
+                    clip.Delays.Add(Math.Min(2000, delay * step));
+                }
+                return clip.Frames.Count > 0 ? clip : null;
+            }
+            catch (Exception) { return null; }
+        }
+
+        async void LoadThumb(PictureBox pb, SgdbAsset asset, int g)
+        {
+            // animated "thumbs" are webm videos, useless to an image decoder -
+            // fetch the real asset file and animate it ourselves
+            string url = asset.Animated ? asset.Url : asset.Thumb;
             byte[] data;
             await thumbSem.WaitAsync();
             try
             {
                 if (g != gen) return;
-                data = await Sgdb.Download(thumbUrl);
+                data = await Sgdb.Download(url);
             }
             catch (Exception) { return; }
             finally { thumbSem.Release(); }
             if (g != gen || pb.IsDisposed) return;
+
+            if (asset.Animated)
+            {
+                int mw = Math.Max(64, pb.Width * 3 / 5);   // decode below display
+                int mh = Math.Max(64, pb.Height * 3 / 5);  // size to save memory
+                AnimClip clip = await Task.Run(() => DecodeClip(data, mw, mh));
+                if (g != gen || pb.IsDisposed)
+                {
+                    if (clip != null) clip.Dispose();
+                    return;
+                }
+                if (clip != null && clip.Frames.Count > 0)
+                {
+                    pb.Image = clip.Frames[0];
+                    if (clip.Frames.Count > 1)
+                        anims.Add(new AnimEntry
+                        {
+                            Pb = pb, Clip = clip,
+                            NextAt = Environment.TickCount + clip.Delays[0]
+                        });
+                    else
+                        clip.Frames.Clear();   // single frame: keep image, drop clip
+                    return;
+                }
+                // fall through: static single-frame fallback below
+            }
             try { pb.Image = Image.FromStream(new MemoryStream(data)); }
             catch (Exception)
             {
-                // GDI+ can't decode WebP; try WIC (uses the Windows WebP codec
-                // when installed), else show a labeled placeholder.
+                // GDI+ can't decode WebP; try WIC for a single frame,
+                // else show a labeled placeholder.
                 Image wic = WicDecode(data);
                 pb.Image = wic != null ? wic : TextThumb(pb.Width, pb.Height);
             }
