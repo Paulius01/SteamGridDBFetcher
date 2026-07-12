@@ -52,11 +52,13 @@ CDN_BASES = (
 )
 
 # key, endpoint, query params, grid-file suffix, label
+# nsfw/humor/epilepsy=any: show everything, the API hides flagged assets by default
+_ALL = {"types": "static,animated", "nsfw": "any", "humor": "any", "epilepsy": "any"}
 TYPES = [
-    ("cover",      "grids",  {"dimensions": "600x900", "types": "static,animated"},         "p",     "Cover (600x900)"),
-    ("wide",       "grids",  {"dimensions": "920x430,460x215", "types": "static,animated"}, "",      "Wide Cover (920x430)"),
-    ("background", "heroes", {"types": "static,animated"},                                  "_hero", "Background (hero)"),
-    ("logo",       "logos",  {"types": "static,animated"},                                  "_logo", "Logo"),
+    ("cover",      "grids",  dict(_ALL, dimensions="600x900"),         "p",     "Cover (600x900)"),
+    ("wide",       "grids",  dict(_ALL, dimensions="920x430,460x215"), "",      "Wide Cover (920x430)"),
+    ("background", "heroes", dict(_ALL),                               "_hero", "Background (hero)"),
+    ("logo",       "logos",  dict(_ALL),                               "_logo", "Logo"),
 ]
 TYPE_BY_KEY = {t[0]: t for t in TYPES}
 

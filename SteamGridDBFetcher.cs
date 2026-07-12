@@ -53,6 +53,7 @@ namespace SteamGridDBFetcher
         public string Thumb;
         public string Mime;
         public bool Animated;
+        public bool Nsfw, Humor, Epilepsy;
     }
 
     class AssetPage
@@ -71,10 +72,12 @@ namespace SteamGridDBFetcher
     {
         public static readonly AType[] Types = new AType[]
         {
-            new AType { Key = "cover",      Endpoint = "grids",  Query = "?dimensions=600x900&types=static,animated",         Suffix = "p",     Label = "Cover (600x900)",      W = 220, H = 330 },
-            new AType { Key = "wide",       Endpoint = "grids",  Query = "?dimensions=920x430,460x215&types=static,animated", Suffix = "",      Label = "Wide Cover (920x430)", W = 430, H = 201 },
-            new AType { Key = "background", Endpoint = "heroes", Query = "?types=static,animated",                            Suffix = "_hero", Label = "Background (hero)",    W = 480, H = 155 },
-            new AType { Key = "logo",       Endpoint = "logos",  Query = "?types=static,animated",                            Suffix = "_logo", Label = "Logo",                 W = 300, H = 150 },
+            // nsfw/humor/epilepsy=any: show everything, the API hides flagged
+            // assets by default
+            new AType { Key = "cover",      Endpoint = "grids",  Query = "?dimensions=600x900&types=static,animated&nsfw=any&humor=any&epilepsy=any",         Suffix = "p",     Label = "Cover (600x900)",      W = 220, H = 330 },
+            new AType { Key = "wide",       Endpoint = "grids",  Query = "?dimensions=920x430,460x215&types=static,animated&nsfw=any&humor=any&epilepsy=any", Suffix = "",      Label = "Wide Cover (920x430)", W = 430, H = 201 },
+            new AType { Key = "background", Endpoint = "heroes", Query = "?types=static,animated&nsfw=any&humor=any&epilepsy=any",                            Suffix = "_hero", Label = "Background (hero)",    W = 480, H = 155 },
+            new AType { Key = "logo",       Endpoint = "logos",  Query = "?types=static,animated&nsfw=any&humor=any&epilepsy=any",                            Suffix = "_logo", Label = "Logo",                 W = 300, H = 150 },
         };
 
         public static readonly string[] ImageExts = new string[] { ".png", ".jpg", ".jpeg", ".webp" };
@@ -456,6 +459,12 @@ namespace SteamGridDBFetcher
             return list;
         }
 
+        static bool Flag(Dictionary<string, object> a, string key)
+        {
+            object v;
+            return a.TryGetValue(key, out v) && v is bool && (bool)v;
+        }
+
         static List<SgdbAsset> ParseAssets(object[] data)
         {
             var list = new List<SgdbAsset>();
@@ -478,7 +487,10 @@ namespace SteamGridDBFetcher
                     Animated = thumbStr.EndsWith(".webm", StringComparison.OrdinalIgnoreCase)
                         || (mimeStr != null &&
                             (mimeStr.IndexOf("apng", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                             mimeStr.IndexOf("gif", StringComparison.OrdinalIgnoreCase) >= 0))
+                             mimeStr.IndexOf("gif", StringComparison.OrdinalIgnoreCase) >= 0)),
+                    Nsfw = Flag(a, "nsfw"),
+                    Humor = Flag(a, "humor"),
+                    Epilepsy = Flag(a, "epilepsy")
                 });
             }
             return list;
@@ -509,7 +521,11 @@ namespace SteamGridDBFetcher
         // for logos and icons, not for grids or heroes.
         public async Task<List<SgdbAsset>> OfficialLogos(int gameId)
         {
-            try { return ParseAssets(await GetData(Base + "/logos/game/" + gameId + "?styles=official")); }
+            try
+            {
+                return ParseAssets(await GetData(
+                    Base + "/logos/game/" + gameId + "?styles=official&nsfw=any&humor=any"));
+            }
             catch (Exception) { return new List<SgdbAsset>(); }
         }
 
@@ -623,11 +639,28 @@ namespace SteamGridDBFetcher
     // --------------------------------------------------------------- main UI
 
     // Scrollable containers with the scrollbars hidden; mouse-wheel scrolling
-    // still works through the WheelRedirector message filter.
+    // still works through the WheelRedirector message filter. WS_EX_COMPOSITED
+    // makes Windows paint the container and all child tiles into one buffer
+    // per frame, eliminating tearing/flicker while scrolling.
     class BareFlowPanel : FlowLayoutPanel
     {
         [DllImport("user32.dll")]
         static extern bool ShowScrollBar(IntPtr hWnd, int wBar, bool bShow);
+
+        public BareFlowPanel()
+        {
+            DoubleBuffered = true;
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= 0x02000000;   // WS_EX_COMPOSITED
+                return cp;
+            }
+        }
 
         protected override void WndProc(ref Message m)
         {
@@ -644,6 +677,21 @@ namespace SteamGridDBFetcher
     {
         [DllImport("user32.dll")]
         static extern bool ShowScrollBar(IntPtr hWnd, int wBar, bool bShow);
+
+        public BarePanel()
+        {
+            DoubleBuffered = true;
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= 0x02000000;   // WS_EX_COMPOSITED
+                return cp;
+            }
+        }
 
         protected override void WndProc(ref Message m)
         {
@@ -710,6 +758,9 @@ namespace SteamGridDBFetcher
         Label selLabel, gameTitle;
         Panel contentPanel;
         FlowLayoutPanel sectionsFlow;
+        CheckBox cbStatic, cbAnimated, cbHumor, cbAdult, cbEpilepsy, cbUntagged;
+        bool suppressFilter;
+        readonly Dictionary<Panel, SgdbAsset> tileAssets = new Dictionary<Panel, SgdbAsset>();
 
         Label statusLabel;
 
@@ -1032,27 +1083,63 @@ namespace SteamGridDBFetcher
             };
             pickerView.Controls.Add(matchCombo);
 
+            // type/tag filters, mirroring the SteamGridDB site (all on = show everything)
+            var filterRow = new FlowLayoutPanel
+            {
+                Location = new Point(12, 124), AutoSize = true, WrapContents = false,
+                BackColor = BG, FlowDirection = FlowDirection.LeftToRight
+            };
+            pickerView.Controls.Add(filterRow);
+
+            filterRow.Controls.Add(FilterHeading("Types", 4));
+            cbStatic = MakeCheck("Static");
+            cbAnimated = MakeCheck("Animated");
+            filterRow.Controls.Add(cbStatic);
+            filterRow.Controls.Add(cbAnimated);
+            filterRow.Controls.Add(FilterHeading("Tags", 18));
+            cbHumor = MakeCheck("Humor");
+            cbAdult = MakeCheck("Adult Content");
+            cbEpilepsy = MakeCheck("Epilepsy");
+            cbUntagged = MakeCheck("Untagged");
+            filterRow.Controls.Add(cbHumor);
+            filterRow.Controls.Add(cbAdult);
+            filterRow.Controls.Add(cbEpilepsy);
+            filterRow.Controls.Add(cbUntagged);
+
+            var allBtn = MakeButton("All", false);
+            allBtn.Margin = new Padding(14, 0, 0, 0);
+            allBtn.Click += delegate
+            {
+                suppressFilter = true;
+                foreach (CheckBox c in AllFilterBoxes()) c.Checked = true;
+                suppressFilter = false;
+                ApplyAssetFilter();
+            };
+            filterRow.Controls.Add(allBtn);
+            foreach (CheckBox c in AllFilterBoxes())
+                c.CheckedChanged += delegate { if (!suppressFilter) ApplyAssetFilter(); };
+
             applyBtn = MakeButton("Apply selected", true);
-            applyBtn.Location = new Point(16, 130);
+            applyBtn.Location = new Point(16, 162);
             applyBtn.Click += delegate { ApplySelected(); };
             pickerView.Controls.Add(applyBtn);
 
             autoBtn = MakeButton("Auto (top picks)", false);
-            autoBtn.Location = new Point(146, 130);
+            autoBtn.Location = new Point(146, 162);
             autoBtn.Click += delegate { AutoOne(); };
             pickerView.Controls.Add(autoBtn);
 
             selLabel = new Label
             {
                 Text = "", ForeColor = DIM, BackColor = BG,
-                Location = new Point(300, 136), AutoSize = true
+                Location = new Point(300, 168), AutoSize = true
             };
             pickerView.Controls.Add(selLabel);
 
             contentPanel = new BarePanel
             {
-                Location = new Point(16, 170),
-                Size = new Size(pickerView.Width - 24, pickerView.Height - 178),
+                Location = new Point(16, 202),
+                Size = new Size(pickerView.Width - 24, pickerView.Height - 210),
                 Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
                 BackColor = BG, AutoScroll = true
             };
@@ -1072,6 +1159,66 @@ namespace SteamGridDBFetcher
             animTimer.Start();
 
             UpdateButtons();
+        }
+
+        Label FilterHeading(string text, int leftGap)
+        {
+            return new Label
+            {
+                Text = text, ForeColor = DIM, BackColor = BG, AutoSize = true,
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+                Margin = new Padding(leftGap, 7, 10, 0)
+            };
+        }
+
+        CheckBox MakeCheck(string text)
+        {
+            return new CheckBox
+            {
+                Text = text, Checked = true, AutoSize = true,
+                ForeColor = TX, BackColor = BG, Cursor = Cursors.Hand,
+                Margin = new Padding(0, 4, 12, 0)
+            };
+        }
+
+        CheckBox[] AllFilterBoxes()
+        {
+            return new CheckBox[] { cbStatic, cbAnimated, cbHumor, cbAdult, cbEpilepsy, cbUntagged };
+        }
+
+        bool ShouldShow(SgdbAsset a)
+        {
+            bool typeOk = a.Animated ? cbAnimated.Checked : cbStatic.Checked;
+            bool tagged = a.Nsfw || a.Humor || a.Epilepsy;
+            bool tagOk = tagged
+                ? (a.Nsfw && cbAdult.Checked) || (a.Humor && cbHumor.Checked) ||
+                  (a.Epilepsy && cbEpilepsy.Checked)
+                : cbUntagged.Checked;
+            return typeOk && tagOk;
+        }
+
+        // Show/hide asset tiles per the type/tag filters (current, Steam
+        // default and Load-more tiles always stay visible).
+        void ApplyAssetFilter()
+        {
+            foreach (var kv in tiles)
+            {
+                foreach (Panel p in kv.Value)
+                {
+                    SgdbAsset a;
+                    if (!p.IsDisposed && tileAssets.TryGetValue(p, out a))
+                        p.Visible = ShouldShow(a);
+                }
+                // if the selected pick just got hidden, fall back to "current"
+                string selUrl;
+                if (sel.TryGetValue(kv.Key, out selUrl))
+                {
+                    Panel selTile = kv.Value.FirstOrDefault(
+                        p => !p.IsDisposed && (p.Tag as string) == selUrl);
+                    if (selTile != null && !selTile.Visible && kv.Value.Count > 0)
+                        SelectTile(kv.Key, kv.Value[0], null);
+                }
+            }
         }
 
         void UpdateFlowWidths()
@@ -1431,7 +1578,7 @@ namespace SteamGridDBFetcher
 
         void ClearSections()
         {
-            flows.Clear(); countLabels.Clear(); tiles.Clear();
+            flows.Clear(); countLabels.Clear(); tiles.Clear(); tileAssets.Clear();
             var old = sectionsFlow.Controls.Cast<Control>().ToList();
             sectionsFlow.Controls.Clear();
             foreach (Control c in old) c.Dispose();
@@ -1568,11 +1715,17 @@ namespace SteamGridDBFetcher
                     ? "none available on SteamGridDB"
                     : pg.Total + " available - click to pick";
 
+                bool preselected = false;
                 for (int i = 0; i < pg.Assets.Count; i++)
                 {
                     Panel tile = AddAssetTile(t, flows[t.Key], pg.Assets[i]);
-                    // default pick: keep existing art if there is any, else top result
-                    if (i == 0 && !hasExisting[t.Key]) SelectTile(t.Key, tile, pg.Assets[i].Url);
+                    // default pick: keep existing art if there is any, else the
+                    // top result that passes the current filters
+                    if (!preselected && !hasExisting[t.Key] && ShouldShow(pg.Assets[i]))
+                    {
+                        SelectTile(t.Key, tile, pg.Assets[i].Url);
+                        preselected = true;
+                    }
                     LoadThumb((PictureBox)tile.Controls[0], pg.Assets[i], g);
                 }
                 if (shownByType[t.Key] < pg.Total)
@@ -1716,6 +1869,8 @@ namespace SteamGridDBFetcher
             }
             flow.Controls.Add(p);
             tiles[key].Add(p);
+            tileAssets[p] = a;
+            p.Visible = ShouldShow(a);
             return p;
         }
 
