@@ -1,4 +1,4 @@
-// SteamGridDB Fetcher - native Windows app (WinForms, .NET Framework 4.8)
+﻿// SteamGridDB Fetcher - native Windows app (WinForms, .NET Framework 4.8)
 //
 // Applies SteamGridDB artwork (Cover, Wide Cover, Background, Logo) to the
 // non-Steam games in your Steam library.
@@ -713,16 +713,18 @@ namespace SteamGridDBFetcher
 
     class MainForm : Form
     {
-        static readonly Color BG = ColorTranslator.FromHtml("#171a21");
-        static readonly Color PANEL = ColorTranslator.FromHtml("#1f2430");
-        static readonly Color PANEL2 = ColorTranslator.FromHtml("#2a3140");
-        static readonly Color FIELD = ColorTranslator.FromHtml("#0e1117");
-        static readonly Color TX = ColorTranslator.FromHtml("#dbe2ec");
-        static readonly Color DIM = ColorTranslator.FromHtml("#8f98a0");
-        static readonly Color ACC = ColorTranslator.FromHtml("#66c0f4");
-        static readonly Color OKC = ColorTranslator.FromHtml("#7bc94e");
-        static readonly Color ERRC = ColorTranslator.FromHtml("#e06c6c");
-        static readonly Color WARN = ColorTranslator.FromHtml("#d9a04a");
+        // slate neutral ramp (one step per elevation) + Steam-blue accent
+        static readonly Color BG = ColorTranslator.FromHtml("#0F1522");      // window
+        static readonly Color PANEL = ColorTranslator.FromHtml("#1B2434");   // bars, cards
+        static readonly Color PANEL2 = ColorTranslator.FromHtml("#28344A");  // hover / raised
+        static readonly Color FIELD = ColorTranslator.FromHtml("#0B111C");   // inputs, status bar
+        static readonly Color BORDER = ColorTranslator.FromHtml("#2E3A50");  // 1px separators
+        static readonly Color TX = ColorTranslator.FromHtml("#E2E8F0");
+        static readonly Color DIM = ColorTranslator.FromHtml("#94A3B8");
+        static readonly Color ACC = ColorTranslator.FromHtml("#66C0F4");     // interactive/selected only
+        static readonly Color OKC = ColorTranslator.FromHtml("#5FCB71");
+        static readonly Color ERRC = ColorTranslator.FromHtml("#F07878");
+        static readonly Color WARN = ColorTranslator.FromHtml("#E8B44C");
 
         const int CoverW = 220, CoverH = 330;
 
@@ -752,6 +754,7 @@ namespace SteamGridDBFetcher
 
         // picker view
         Panel pickerView;
+        Panel pickerHeader;
         Button backBtn, searchBtn, applyBtn, autoBtn;
         TextBox searchBox;
         ComboBox matchCombo;
@@ -771,6 +774,7 @@ namespace SteamGridDBFetcher
         readonly Dictionary<string, int> shownByType = new Dictionary<string, int>();
         readonly Dictionary<string, List<Panel>> tiles = new Dictionary<string, List<Panel>>();
         readonly Dictionary<string, string> sel = new Dictionary<string, string>();
+        readonly Dictionary<string, Label> selBadges = new Dictionary<string, Label>();
         readonly HashSet<uint> applied = new HashSet<uint>();
         readonly List<SgdbGame> matches = new List<SgdbGame>();
         readonly SemaphoreSlim thumbSem = new SemaphoreSlim(6);
@@ -863,6 +867,7 @@ namespace SteamGridDBFetcher
                 suppressSteamBox = true;
                 steamBox.Checked = Cfg.Int(cfg, "show_steam", 0) == 1;
                 suppressSteamBox = false;
+                LoadFilters();
                 ReloadLibrary();
                 UpdateButtons();   // enables Auto-apply ALL right away
                 SetStatus("Ready. Click a game to pick its artwork.", DIM);
@@ -919,7 +924,7 @@ namespace SteamGridDBFetcher
                 Text = text,
                 FlatStyle = FlatStyle.Flat,
                 BackColor = accent ? ACC : PANEL2,
-                ForeColor = accent ? ColorTranslator.FromHtml("#08131c") : TX,
+                ForeColor = accent ? ColorTranslator.FromHtml("#06121C") : TX,
                 Font = new Font("Segoe UI", 9f, FontStyle.Bold),
                 Cursor = Cursors.Hand,
                 AutoSize = true,
@@ -927,19 +932,23 @@ namespace SteamGridDBFetcher
                 Padding = new Padding(14, 7, 14, 7)
             };
             b.FlatAppearance.BorderSize = 0;
-            b.FlatAppearance.MouseOverBackColor = accent ? ColorTranslator.FromHtml("#8ad0f8") : PANEL;
+            b.FlatAppearance.MouseOverBackColor = accent ? ColorTranslator.FromHtml("#8AD0F8") : ColorTranslator.FromHtml("#324058");
+            b.FlatAppearance.MouseDownBackColor = accent ? ColorTranslator.FromHtml("#4FAEE8") : ColorTranslator.FromHtml("#1F2A3D");
             return b;
         }
 
         void BuildUi()
         {
+            var statusBar = new Panel { Dock = DockStyle.Bottom, Height = 37, BackColor = FIELD };
             statusLabel = new Label
             {
-                Dock = DockStyle.Bottom, Height = 32, BackColor = FIELD, ForeColor = DIM,
-                TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(12, 0, 0, 0),
+                Dock = DockStyle.Fill, BackColor = FIELD, ForeColor = DIM,
+                TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(16, 0, 0, 0),
                 Text = "Starting..."
             };
-            Controls.Add(statusLabel);
+            statusBar.Controls.Add(statusLabel);
+            statusBar.Controls.Add(new Panel { Dock = DockStyle.Top, Height = 1, BackColor = BORDER });
+            Controls.Add(statusBar);
 
             // ------------------------------------------------- library view
             libraryView = new Panel { Dock = DockStyle.Fill, BackColor = BG };
@@ -951,9 +960,9 @@ namespace SteamGridDBFetcher
 
             var title = new Label
             {
-                Text = "SteamGridDB Fetcher", ForeColor = ACC, BackColor = PANEL,
+                Text = "SteamGridDB Fetcher", ForeColor = TX, BackColor = PANEL,
                 Font = new Font("Segoe UI", 13f, FontStyle.Bold),
-                Location = new Point(18, 10), AutoSize = true
+                Location = new Point(16, 10), AutoSize = true
             };
             topBar.Controls.Add(title);
 
@@ -961,7 +970,7 @@ namespace SteamGridDBFetcher
             {
                 Text = "", ForeColor = DIM, BackColor = PANEL,
                 Font = new Font("Segoe UI", 8.5f),
-                Location = new Point(20, 38), AutoSize = true
+                Location = new Point(16, 38), AutoSize = true
             };
             topBar.Controls.Add(profileLabel);
 
@@ -969,9 +978,10 @@ namespace SteamGridDBFetcher
             {
                 Dock = DockStyle.Right, AutoSize = true, WrapContents = false,
                 FlowDirection = FlowDirection.LeftToRight, BackColor = PANEL,
-                Padding = new Padding(0, 15, 12, 0)
+                Padding = new Padding(0, 15, 16, 0)
             };
             topBar.Controls.Add(tools);
+            topBar.Controls.Add(new Panel { Dock = DockStyle.Bottom, Height = 1, BackColor = BORDER });
 
             steamBox = new CheckBox
             {
@@ -1018,7 +1028,7 @@ namespace SteamGridDBFetcher
             libraryFlow = new BareFlowPanel
             {
                 Dock = DockStyle.Fill, AutoScroll = true, BackColor = BG,
-                Padding = new Padding(12, 10, 12, 10)
+                Padding = new Padding(16, 12, 16, 12)
             };
             libraryView.Controls.Add(libraryFlow);
             libraryFlow.BringToFront();
@@ -1028,52 +1038,94 @@ namespace SteamGridDBFetcher
             Controls.Add(pickerView);
             pickerView.BringToFront();
 
+            // header: every picker control lives in one auto-sized docked
+            // stack, so rows grow with content and nothing can overlap
+            pickerHeader = new Panel
+            {
+                Dock = DockStyle.Top, BackColor = PANEL,
+                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink
+            };
+            pickerView.Controls.Add(pickerHeader);
+
+            // border first: added earlier = docked later = below the stack
+            pickerHeader.Controls.Add(new Panel { Dock = DockStyle.Top, Height = 1, BackColor = BORDER });
+
+            var headerStack = new TableLayoutPanel
+            {
+                Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                BackColor = PANEL, ColumnCount = 1, Padding = new Padding(16, 10, 16, 12)
+            };
+            headerStack.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            pickerHeader.Controls.Add(headerStack);
+
+            var titleRow = new FlowLayoutPanel
+            {
+                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                WrapContents = true, BackColor = PANEL, Dock = DockStyle.Fill,
+                Margin = new Padding(0)
+            };
+            headerStack.Controls.Add(titleRow);
+
             backBtn = MakeButton("<   Library", false);
-            backBtn.Location = new Point(16, 14);
+            backBtn.Margin = new Padding(0, 0, 12, 0);
             backBtn.Click += delegate { BackToLibrary(); };
-            pickerView.Controls.Add(backBtn);
+            titleRow.Controls.Add(backBtn);
 
             gameTitle = new Label
             {
-                Text = "", ForeColor = ACC, BackColor = BG,
+                Text = "", ForeColor = TX, BackColor = PANEL,
                 Font = new Font("Segoe UI", 12f, FontStyle.Bold),
-                Location = new Point(140, 18), AutoSize = true
+                AutoSize = true, Margin = new Padding(0, 5, 0, 0)
             };
-            pickerView.Controls.Add(gameTitle);
+            titleRow.Controls.Add(gameTitle);
+
+            var searchRow = new TableLayoutPanel
+            {
+                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Dock = DockStyle.Fill, BackColor = PANEL, ColumnCount = 2,
+                Margin = new Padding(0, 8, 0, 0)
+            };
+            searchRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            searchRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            headerStack.Controls.Add(searchRow);
 
             searchBox = new TextBox
             {
-                Location = new Point(16, 58), Size = new Size(pickerView.Width - 160, 26),
-                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+                Anchor = AnchorStyles.Left | AnchorStyles.Right,
                 BackColor = FIELD, ForeColor = TX, BorderStyle = BorderStyle.FixedSingle,
-                Font = new Font("Segoe UI", 10f)
+                Font = new Font("Segoe UI", 10f), Margin = new Padding(0, 0, 8, 0)
             };
             searchBox.KeyDown += delegate(object s, KeyEventArgs e)
             {
                 if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; DoSearch(); }
             };
-            pickerView.Controls.Add(searchBox);
+            searchRow.Controls.Add(searchBox, 0, 0);
 
             searchBtn = MakeButton("Search", true);
-            searchBtn.AutoSize = false;
-            searchBtn.Size = new Size(120, 36);
-            searchBtn.Location = new Point(pickerView.Width - 138, 54);
-            searchBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            searchBtn.Margin = new Padding(0);
             searchBtn.Click += delegate { DoSearch(); };
-            pickerView.Controls.Add(searchBtn);
+            searchRow.Controls.Add(searchBtn, 1, 0);
+
+            var matchRow = new FlowLayoutPanel
+            {
+                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                WrapContents = false, BackColor = PANEL, Dock = DockStyle.Fill,
+                Margin = new Padding(0, 8, 0, 0)
+            };
+            headerStack.Controls.Add(matchRow);
 
             var matchLbl = new Label
             {
-                Text = "Match:", ForeColor = DIM, BackColor = BG,
-                Location = new Point(16, 98), AutoSize = true
+                Text = "Match:", ForeColor = DIM, BackColor = PANEL,
+                AutoSize = true, Margin = new Padding(0, 6, 8, 0)
             };
-            pickerView.Controls.Add(matchLbl);
+            matchRow.Controls.Add(matchLbl);
 
             matchCombo = new ComboBox
             {
-                Location = new Point(70, 94), Size = new Size(420, 26),
+                Size = new Size(420, 26),
                 DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat,
-                BackColor = PANEL2, ForeColor = TX
+                BackColor = PANEL2, ForeColor = TX, Margin = new Padding(0)
             };
             matchCombo.SelectedIndexChanged += delegate
             {
@@ -1081,22 +1133,23 @@ namespace SteamGridDBFetcher
                 if (matchCombo.SelectedIndex < matches.Count)
                     LoadAssets(matches[matchCombo.SelectedIndex].Id, matches[matchCombo.SelectedIndex].Name);
             };
-            pickerView.Controls.Add(matchCombo);
+            matchRow.Controls.Add(matchCombo);
 
             // type/tag filters, mirroring the SteamGridDB site (all on = show everything)
             var filterRow = new FlowLayoutPanel
             {
-                Location = new Point(12, 124), AutoSize = true, WrapContents = false,
-                BackColor = BG, FlowDirection = FlowDirection.LeftToRight
+                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                WrapContents = true, BackColor = PANEL, Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0, 8, 0, 0)
             };
-            pickerView.Controls.Add(filterRow);
+            headerStack.Controls.Add(filterRow);
 
-            filterRow.Controls.Add(FilterHeading("Types", 4));
+            filterRow.Controls.Add(FilterHeading("Types", 0));
             cbStatic = MakeCheck("Static");
             cbAnimated = MakeCheck("Animated");
             filterRow.Controls.Add(cbStatic);
             filterRow.Controls.Add(cbAnimated);
-            filterRow.Controls.Add(FilterHeading("Tags", 18));
+            filterRow.Controls.Add(FilterHeading("Tags", 16));
             cbHumor = MakeCheck("Humor");
             cbAdult = MakeCheck("Adult Content");
             cbEpilepsy = MakeCheck("Epilepsy");
@@ -1107,49 +1160,61 @@ namespace SteamGridDBFetcher
             filterRow.Controls.Add(cbUntagged);
 
             var allBtn = MakeButton("All", false);
-            allBtn.Margin = new Padding(14, 0, 0, 0);
+            allBtn.Margin = new Padding(16, 0, 0, 0);
             allBtn.Click += delegate
             {
                 suppressFilter = true;
                 foreach (CheckBox c in AllFilterBoxes()) c.Checked = true;
                 suppressFilter = false;
+                SaveFilters();
                 ApplyAssetFilter();
             };
             filterRow.Controls.Add(allBtn);
             foreach (CheckBox c in AllFilterBoxes())
-                c.CheckedChanged += delegate { if (!suppressFilter) ApplyAssetFilter(); };
+                c.CheckedChanged += delegate
+                {
+                    if (suppressFilter) return;
+                    SaveFilters();
+                    ApplyAssetFilter();
+                };
+
+            var actionRow = new FlowLayoutPanel
+            {
+                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                WrapContents = true, BackColor = PANEL, Dock = DockStyle.Fill,
+                Margin = new Padding(0, 12, 0, 0)
+            };
+            headerStack.Controls.Add(actionRow);
 
             applyBtn = MakeButton("Apply selected", true);
-            applyBtn.Location = new Point(16, 162);
+            applyBtn.Margin = new Padding(0, 0, 8, 0);
             applyBtn.Click += delegate { ApplySelected(); };
-            pickerView.Controls.Add(applyBtn);
+            actionRow.Controls.Add(applyBtn);
 
             autoBtn = MakeButton("Auto (top picks)", false);
-            autoBtn.Location = new Point(146, 162);
+            autoBtn.Margin = new Padding(0, 0, 12, 0);
             autoBtn.Click += delegate { AutoOne(); };
-            pickerView.Controls.Add(autoBtn);
+            actionRow.Controls.Add(autoBtn);
 
             selLabel = new Label
             {
-                Text = "", ForeColor = DIM, BackColor = BG,
-                Location = new Point(300, 168), AutoSize = true
+                Text = "", ForeColor = DIM, BackColor = PANEL,
+                AutoSize = true, Margin = new Padding(0, 8, 0, 0)
             };
-            pickerView.Controls.Add(selLabel);
+            actionRow.Controls.Add(selLabel);
 
             contentPanel = new BarePanel
             {
-                Location = new Point(16, 202),
-                Size = new Size(pickerView.Width - 24, pickerView.Height - 210),
-                Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
-                BackColor = BG, AutoScroll = true
+                Dock = DockStyle.Fill, BackColor = BG, AutoScroll = true
             };
             pickerView.Controls.Add(contentPanel);
+            contentPanel.BringToFront();
 
             sectionsFlow = new FlowLayoutPanel
             {
                 FlowDirection = FlowDirection.TopDown, WrapContents = false,
                 AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                BackColor = BG, Location = new Point(0, 0)
+                BackColor = BG, Location = new Point(16, 4)
             };
             contentPanel.Controls.Add(sectionsFlow);
             contentPanel.Resize += delegate { UpdateFlowWidths(); };
@@ -1165,7 +1230,7 @@ namespace SteamGridDBFetcher
         {
             return new Label
             {
-                Text = text, ForeColor = DIM, BackColor = BG, AutoSize = true,
+                Text = text, ForeColor = DIM, BackColor = PANEL, AutoSize = true,
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
                 Margin = new Padding(leftGap, 7, 10, 0)
             };
@@ -1176,7 +1241,7 @@ namespace SteamGridDBFetcher
             return new CheckBox
             {
                 Text = text, Checked = true, AutoSize = true,
-                ForeColor = TX, BackColor = BG, Cursor = Cursors.Hand,
+                ForeColor = TX, BackColor = PANEL, Cursor = Cursors.Hand,
                 Margin = new Padding(0, 4, 12, 0)
             };
         }
@@ -1184,6 +1249,28 @@ namespace SteamGridDBFetcher
         CheckBox[] AllFilterBoxes()
         {
             return new CheckBox[] { cbStatic, cbAnimated, cbHumor, cbAdult, cbEpilepsy, cbUntagged };
+        }
+
+        // the type/tag filters are global and persist between runs (config.json)
+        static readonly string[] FilterKeys = new string[]
+            { "f_static", "f_animated", "f_humor", "f_adult", "f_epilepsy", "f_untagged" };
+
+        void LoadFilters()
+        {
+            suppressFilter = true;
+            CheckBox[] boxes = AllFilterBoxes();
+            for (int i = 0; i < boxes.Length; i++)
+                boxes[i].Checked = Cfg.Int(cfg, FilterKeys[i], 1) == 1;
+            suppressFilter = false;
+        }
+
+        void SaveFilters()
+        {
+            if (cfg == null) return;
+            CheckBox[] boxes = AllFilterBoxes();
+            for (int i = 0; i < boxes.Length; i++)
+                cfg[FilterKeys[i]] = boxes[i].Checked ? 1 : 0;
+            Cfg.Save(cfg);
         }
 
         bool ShouldShow(SgdbAsset a)
@@ -1223,7 +1310,7 @@ namespace SteamGridDBFetcher
 
         void UpdateFlowWidths()
         {
-            int w = Math.Max(300, contentPanel.ClientSize.Width - 28);
+            int w = Math.Max(300, contentPanel.ClientSize.Width - 48);
             foreach (var f in flows.Values) f.MaximumSize = new Size(w, 0);
         }
 
@@ -1382,7 +1469,7 @@ namespace SteamGridDBFetcher
             {
                 using (var lg = new LinearGradientBrush(
                     new Rectangle(0, 0, CoverW, CoverH),
-                    ColorTranslator.FromHtml("#4d5b6d"), ColorTranslator.FromHtml("#20262f"), 65f))
+                    ColorTranslator.FromHtml("#3E4E6B"), ColorTranslator.FromHtml("#1B2434"), 65f))
                     g.FillRectangle(lg, 0, 0, CoverW, CoverH);
                 TextRenderer.DrawText(g, sc.Name, new Font("Segoe UI", 10f),
                     new Rectangle(10, 10, CoverW - 20, CoverH - 20),
@@ -1457,8 +1544,8 @@ namespace SteamGridDBFetcher
                 var tile = new GameTile();
                 tile.Root = new Panel
                 {
-                    Size = new Size(CoverW + 8, CoverH + 46), BackColor = BG,
-                    Margin = new Padding(7), Cursor = Cursors.Hand
+                    Size = new Size(CoverW + 8, CoverH + 48), BackColor = PANEL,
+                    Margin = new Padding(8), Cursor = Cursors.Hand
                 };
                 tile.Pic = new PictureBox
                 {
@@ -1469,13 +1556,13 @@ namespace SteamGridDBFetcher
                 tile.Name = new Label
                 {
                     Location = new Point(4, CoverH + 10), Size = new Size(CoverW, 17),
-                    ForeColor = TX, BackColor = BG, AutoEllipsis = true, Text = sc.Name,
+                    ForeColor = TX, BackColor = PANEL, AutoEllipsis = true, Text = sc.Name,
                     Cursor = Cursors.Hand
                 };
                 tile.Status = new Label
                 {
-                    Location = new Point(4, CoverH + 28), Size = new Size(CoverW, 14),
-                    ForeColor = DIM, BackColor = BG, Font = new Font("Segoe UI", 7.5f),
+                    Location = new Point(4, CoverH + 28), Size = new Size(CoverW, 16),
+                    ForeColor = DIM, BackColor = PANEL, Font = new Font("Segoe UI", 8.25f),
                     Cursor = Cursors.Hand
                 };
                 tile.Root.Controls.Add(tile.Pic);
@@ -1489,7 +1576,7 @@ namespace SteamGridDBFetcher
 
                 GameTile t = tile;
                 EventHandler enter = delegate { t.Root.BackColor = PANEL2; t.Name.BackColor = PANEL2; t.Status.BackColor = PANEL2; };
-                EventHandler leave = delegate { t.Root.BackColor = BG; t.Name.BackColor = BG; t.Status.BackColor = BG; };
+                EventHandler leave = delegate { t.Root.BackColor = PANEL; t.Name.BackColor = PANEL; t.Status.BackColor = PANEL; };
                 foreach (Control c in new Control[] { tile.Root, tile.Pic, tile.Name, tile.Status })
                 {
                     c.MouseEnter += enter;
@@ -1544,6 +1631,11 @@ namespace SteamGridDBFetcher
             gameTitle.Text = sc.Name;
             libraryView.Visible = false;
             pickerView.Visible = true;
+            // layout is deferred while the view is hidden; without this the
+            // auto-sized header keeps a stale height and the content docks
+            // below it, leaving a dead gap until the next layout event
+            pickerHeader.PerformLayout();
+            pickerView.PerformLayout();
             searchBox.Text = sc.Name;
             DoSearch();
         }
@@ -1579,6 +1671,7 @@ namespace SteamGridDBFetcher
         void ClearSections()
         {
             flows.Clear(); countLabels.Clear(); tiles.Clear(); tileAssets.Clear();
+            selBadges.Clear();   // badges are children of the disposed tiles
             var old = sectionsFlow.Controls.Cast<Control>().ToList();
             sectionsFlow.Controls.Clear();
             foreach (Control c in old) c.Dispose();
@@ -1664,7 +1757,7 @@ namespace SteamGridDBFetcher
                 var cnt = new Label
                 {
                     Text = "loading...", ForeColor = DIM, BackColor = BG, AutoSize = true,
-                    Font = new Font("Segoe UI", 8f), Margin = new Padding(5, 2, 0, 2)
+                    Font = new Font("Segoe UI", 8.25f), Margin = new Padding(5, 2, 0, 2)
                 };
                 countLabels[t.Key] = cnt;
                 sectionsFlow.Controls.Add(cnt);
@@ -1726,7 +1819,8 @@ namespace SteamGridDBFetcher
                         SelectTile(t.Key, tile, pg.Assets[i].Url);
                         preselected = true;
                     }
-                    LoadThumb((PictureBox)tile.Controls[0], pg.Assets[i], g);
+                    // by type, not index: the selection badge sits at index 0
+                    LoadThumb(tile.Controls.OfType<PictureBox>().First(), pg.Assets[i], g);
                 }
                 if (shownByType[t.Key] < pg.Total)
                     AddLoadMoreTile(t, g);
@@ -1747,9 +1841,9 @@ namespace SteamGridDBFetcher
             var caption = new Label
             {
                 Text = existingPath != null ? "current" : "none",
-                ForeColor = existingPath != null ? ACC : WARN,
-                BackColor = FIELD, Font = new Font("Segoe UI", 7.5f),
-                Location = new Point(5, 5 + t.H - 16), Size = new Size(t.W, 16),
+                ForeColor = existingPath != null ? DIM : WARN,
+                BackColor = FIELD, Font = new Font("Segoe UI", 8.25f),
+                Location = new Point(5, 5 + t.H - 18), Size = new Size(t.W, 18),
                 TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand
             };
             string key = t.Key;
@@ -1759,7 +1853,7 @@ namespace SteamGridDBFetcher
             {
                 var pb = new PictureBox
                 {
-                    Location = new Point(5, 5), Size = new Size(t.W, t.H - 16),
+                    Location = new Point(5, 5), Size = new Size(t.W, t.H - 18),
                     SizeMode = PictureBoxSizeMode.Zoom, BackColor = FIELD, Cursor = Cursors.Hand
                 };
                 try
@@ -1776,9 +1870,9 @@ namespace SteamGridDBFetcher
                 var empty = new Label
                 {
                     Text = "keep\nempty", ForeColor = DIM, BackColor = FIELD,
-                    Location = new Point(5, 5), Size = new Size(t.W, t.H - 16),
+                    Location = new Point(5, 5), Size = new Size(t.W, t.H - 18),
                     TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand,
-                    Font = new Font("Segoe UI", 8f)
+                    Font = new Font("Segoe UI", 8.25f)
                 };
                 p.Controls.Add(empty);
                 empty.Click += h;
@@ -1816,15 +1910,15 @@ namespace SteamGridDBFetcher
             };
             var pb = new PictureBox
             {
-                Location = new Point(5, 5), Size = new Size(t.W, t.H - 16),
+                Location = new Point(5, 5), Size = new Size(t.W, t.H - 18),
                 SizeMode = PictureBoxSizeMode.Zoom, BackColor = FIELD,
                 Cursor = Cursors.Hand, Image = img
             };
             var caption = new Label
             {
                 Text = "Steam default", ForeColor = OKC, BackColor = FIELD,
-                Font = new Font("Segoe UI", 7.5f),
-                Location = new Point(5, 5 + t.H - 16), Size = new Size(t.W, 16),
+                Font = new Font("Segoe UI", 8.25f),
+                Location = new Point(5, 5 + t.H - 18), Size = new Size(t.W, 18),
                 TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand
             };
             p.Controls.Add(pb);
@@ -1848,7 +1942,7 @@ namespace SteamGridDBFetcher
             };
             var pb = new PictureBox
             {
-                Location = new Point(5, 5), Size = new Size(t.W, animated ? t.H - 16 : t.H),
+                Location = new Point(5, 5), Size = new Size(t.W, animated ? t.H - 18 : t.H),
                 SizeMode = PictureBoxSizeMode.Zoom, BackColor = FIELD, Cursor = Cursors.Hand
             };
             p.Controls.Add(pb);
@@ -1859,9 +1953,9 @@ namespace SteamGridDBFetcher
             {
                 var cap = new Label
                 {
-                    Text = "animated", ForeColor = ACC, BackColor = FIELD,
-                    Font = new Font("Segoe UI", 7.5f),
-                    Location = new Point(5, 5 + t.H - 16), Size = new Size(t.W, 16),
+                    Text = "animated", ForeColor = DIM, BackColor = FIELD,
+                    Font = new Font("Segoe UI", 8.25f),
+                    Location = new Point(5, 5 + t.H - 18), Size = new Size(t.W, 18),
                     TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand
                 };
                 p.Controls.Add(cap);
@@ -1885,7 +1979,7 @@ namespace SteamGridDBFetcher
             };
             var lbl = new Label
             {
-                Text = "Load more\n(" + remaining + " left)", ForeColor = ACC, BackColor = PANEL2,
+                Text = "Load more\n(" + remaining + " left)", ForeColor = TX, BackColor = PANEL2,
                 Location = new Point(5, 5), Size = new Size(t.W, t.H),
                 TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand,
                 Font = new Font("Segoe UI", 9f, FontStyle.Bold)
@@ -1911,7 +2005,7 @@ namespace SteamGridDBFetcher
             foreach (SgdbAsset a in pg.Assets)
             {
                 Panel tp = AddAssetTile(t, flow, a);
-                LoadThumb((PictureBox)tp.Controls[0], a, g);
+                LoadThumb(tp.Controls.OfType<PictureBox>().First(), a, g);
             }
             shownByType[t.Key] += pg.Assets.Count;
             if (pg.Assets.Count > 0 && shownByType[t.Key] < totalByType[t.Key])
@@ -2101,6 +2195,30 @@ namespace SteamGridDBFetcher
             foreach (Panel p in list)
                 if (!p.IsDisposed) p.BackColor = PANEL;
             tile.BackColor = ACC;
+
+            // check badge so the pick isn't indicated by the ring color alone
+            Label badge;
+            if (selBadges.TryGetValue(typeKey, out badge))
+            {
+                if (!badge.IsDisposed)
+                {
+                    if (badge.Parent != null) badge.Parent.Controls.Remove(badge);
+                    badge.Dispose();
+                }
+                selBadges.Remove(typeKey);
+            }
+            badge = new Label
+            {
+                Text = "✓", BackColor = ACC,
+                ForeColor = ColorTranslator.FromHtml("#06121C"),
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+                Size = new Size(22, 22), TextAlign = ContentAlignment.MiddleCenter,
+                Location = new Point(tile.Width - 27, 5)
+            };
+            tile.Controls.Add(badge);
+            badge.BringToFront();
+            selBadges[typeKey] = badge;
+
             if (url != null) sel[typeKey] = url;
             else sel.Remove(typeKey);
             UpdateButtons();
