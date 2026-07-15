@@ -1,16 +1,21 @@
-﻿// SteamGridDB Fetcher - native Windows app (WinForms, .NET Framework 4.8)
+// SteamGridDB Fetcher - native Windows app (WinForms, .NET Framework 4.8)
 //
 // Applies SteamGridDB artwork (Cover, Wide Cover, Background, Logo) to the
-// non-Steam games in your Steam library.
+// non-Steam games (and optionally Steam games) in your Steam library.
+//
+// UI model:
+//   * Library: poster grid with scope segments (All / Missing art / Non-Steam
+//     / Steam), search, per-game slot meters, batch "Fill missing art".
+//   * Game workspace: left rail (identity, slot checklist, staged changes,
+//     Apply/Undo) + asset browser with type/tag filters, Steam defaults,
+//     community assets and animated previews. Picks are STAGED, then applied.
 //
 // Safety:
-//   * Reads shortcuts.vdf READ-ONLY to find your games.
+//   * Reads shortcuts.vdf / appmanifests READ-ONLY.
 //   * Only ever writes image files into <Steam>\userdata\<you>\config\grid\ -
 //     the same files Steam's own "Change" artwork button creates.
-//   * Never modifies shortcuts.vdf, game files, the Steam client or any
-//     process. The images are only ever loaded by the Steam UI, never by a
-//     game, so anti-cheat is never involved.
-//   * Replaced artwork is backed up to .\backups\<timestamp>\ first.
+//   * Replaced artwork is backed up to .\backups\<timestamp>\ first; the last
+//     apply can be undone from inside the app.
 //
 // Build (uses the C# compiler that ships with Windows):  build.bat
 
@@ -64,7 +69,7 @@ namespace SteamGridDBFetcher
 
     class AType
     {
-        public string Key, Endpoint, Query, Suffix, Label;
+        public string Key, Endpoint, Query, Suffix, Label, Short;
         public int W, H;   // thumbnail box
     }
 
@@ -72,12 +77,11 @@ namespace SteamGridDBFetcher
     {
         public static readonly AType[] Types = new AType[]
         {
-            // nsfw/humor/epilepsy=any: show everything, the API hides flagged
-            // assets by default
-            new AType { Key = "cover",      Endpoint = "grids",  Query = "?dimensions=600x900&types=static,animated&nsfw=any&humor=any&epilepsy=any",         Suffix = "p",     Label = "Cover (600x900)",      W = 220, H = 330 },
-            new AType { Key = "wide",       Endpoint = "grids",  Query = "?dimensions=920x430,460x215&types=static,animated&nsfw=any&humor=any&epilepsy=any", Suffix = "",      Label = "Wide Cover (920x430)", W = 430, H = 201 },
-            new AType { Key = "background", Endpoint = "heroes", Query = "?types=static,animated&nsfw=any&humor=any&epilepsy=any",                            Suffix = "_hero", Label = "Background (hero)",    W = 480, H = 155 },
-            new AType { Key = "logo",       Endpoint = "logos",  Query = "?types=static,animated&nsfw=any&humor=any&epilepsy=any",                            Suffix = "_logo", Label = "Logo",                 W = 300, H = 150 },
+            // nsfw/humor/epilepsy=any: fetch everything, filtering is client-side
+            new AType { Key = "cover",      Endpoint = "grids",  Query = "?dimensions=600x900&types=static,animated&nsfw=any&humor=any&epilepsy=any",         Suffix = "p",     Label = "Cover (600x900)",      Short = "Cover",      W = 220, H = 330 },
+            new AType { Key = "wide",       Endpoint = "grids",  Query = "?dimensions=920x430,460x215&types=static,animated&nsfw=any&humor=any&epilepsy=any", Suffix = "",      Label = "Wide Cover (920x430)", Short = "Wide cover", W = 430, H = 201 },
+            new AType { Key = "background", Endpoint = "heroes", Query = "?types=static,animated&nsfw=any&humor=any&epilepsy=any",                            Suffix = "_hero", Label = "Background (hero)",    Short = "Background", W = 480, H = 155 },
+            new AType { Key = "logo",       Endpoint = "logos",  Query = "?types=static,animated&nsfw=any&humor=any&epilepsy=any",                            Suffix = "_logo", Label = "Logo",                 Short = "Logo",       W = 300, H = 150 },
         };
 
         public static readonly string[] ImageExts = new string[] { ".png", ".jpg", ".jpeg", ".webp" };
@@ -404,6 +408,43 @@ namespace SteamGridDBFetcher
             return 0;
         }
 
+        static bool Flag(Dictionary<string, object> a, string key)
+        {
+            object v;
+            return a.TryGetValue(key, out v) && v is bool && (bool)v;
+        }
+
+        static List<SgdbAsset> ParseAssets(object[] data)
+        {
+            var list = new List<SgdbAsset>();
+            foreach (object o in data)
+            {
+                var a = o as Dictionary<string, object>;
+                if (a == null) continue;
+                object url, thumb, mime;
+                if (!a.TryGetValue("url", out url)) continue;
+                a.TryGetValue("thumb", out thumb);
+                a.TryGetValue("mime", out mime);
+                string thumbStr = thumb != null ? Convert.ToString(thumb) : Convert.ToString(url);
+                string mimeStr = mime != null ? Convert.ToString(mime) : null;
+                list.Add(new SgdbAsset
+                {
+                    Url = Convert.ToString(url),
+                    Thumb = thumbStr,
+                    Mime = mimeStr,
+                    // SGDB gives animated assets a .webm video as "thumb"
+                    Animated = thumbStr.EndsWith(".webm", StringComparison.OrdinalIgnoreCase)
+                        || (mimeStr != null &&
+                            (mimeStr.IndexOf("apng", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             mimeStr.IndexOf("gif", StringComparison.OrdinalIgnoreCase) >= 0)),
+                    Nsfw = Flag(a, "nsfw"),
+                    Humor = Flag(a, "humor"),
+                    Epilepsy = Flag(a, "epilepsy")
+                });
+            }
+            return list;
+        }
+
         // Alternative search terms for shortcut names that don't match as-is:
         // separators to spaces, CamelCase split, letter/digit split, and
         // stripped noise suffixes ("Ver1", "Steam", ...).
@@ -418,7 +459,7 @@ namespace SteamGridDBFetcher
                     !alts.Contains(s, StringComparer.OrdinalIgnoreCase))
                     alts.Add(s);
             };
-            string spaced = Regex.Replace(name, @"[_\-\.]+", " ");
+            string spaced = Regex.Replace(name, @"[_\-.]+", " ");
             add(spaced);
             string camel = Regex.Replace(spaced, @"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ");
             add(camel);
@@ -455,43 +496,6 @@ namespace SteamGridDBFetcher
                 object id, name;
                 if (g.TryGetValue("id", out id) && g.TryGetValue("name", out name))
                     list.Add(new SgdbGame { Id = Convert.ToInt32(id), Name = Convert.ToString(name) });
-            }
-            return list;
-        }
-
-        static bool Flag(Dictionary<string, object> a, string key)
-        {
-            object v;
-            return a.TryGetValue(key, out v) && v is bool && (bool)v;
-        }
-
-        static List<SgdbAsset> ParseAssets(object[] data)
-        {
-            var list = new List<SgdbAsset>();
-            foreach (object o in data)
-            {
-                var a = o as Dictionary<string, object>;
-                if (a == null) continue;
-                object url, thumb, mime;
-                if (!a.TryGetValue("url", out url)) continue;
-                a.TryGetValue("thumb", out thumb);
-                a.TryGetValue("mime", out mime);
-                string thumbStr = thumb != null ? Convert.ToString(thumb) : Convert.ToString(url);
-                string mimeStr = mime != null ? Convert.ToString(mime) : null;
-                list.Add(new SgdbAsset
-                {
-                    Url = Convert.ToString(url),
-                    Thumb = thumbStr,
-                    Mime = mimeStr,
-                    // SGDB gives animated assets a .webm video as "thumb"
-                    Animated = thumbStr.EndsWith(".webm", StringComparison.OrdinalIgnoreCase)
-                        || (mimeStr != null &&
-                            (mimeStr.IndexOf("apng", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                             mimeStr.IndexOf("gif", StringComparison.OrdinalIgnoreCase) >= 0)),
-                    Nsfw = Flag(a, "nsfw"),
-                    Humor = Flag(a, "humor"),
-                    Epilepsy = Flag(a, "epilepsy")
-                });
             }
             return list;
         }
@@ -546,6 +550,14 @@ namespace SteamGridDBFetcher
 
     static class SteamStore
     {
+        // Valve serves official art from two CDN layouts; newer titles often
+        // exist only on the second one.
+        public static readonly string[] CdnBases = new string[]
+        {
+            "https://cdn.cloudflare.steamstatic.com/steam/apps/",
+            "https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/",
+        };
+
         // The default artwork files Steam itself uses for every store game.
         static readonly Dictionary<string, string[]> Files = new Dictionary<string, string[]>
         {
@@ -553,14 +565,6 @@ namespace SteamGridDBFetcher
             { "wide",       new string[] { "header.jpg" } },
             { "background", new string[] { "library_hero_2x.jpg", "library_hero.jpg" } },
             { "logo",       new string[] { "logo_2x.png", "logo.png" } },
-        };
-
-        // Valve serves official art from two CDN layouts; newer titles often
-        // exist only on the second one.
-        public static readonly string[] CdnBases = new string[]
-        {
-            "https://cdn.cloudflare.steamstatic.com/steam/apps/",
-            "https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/",
         };
 
         // Preview candidates (always-present non-2x variant, on each CDN).
@@ -573,24 +577,27 @@ namespace SteamGridDBFetcher
             return list;
         }
 
-        // Apply the official Steam default for one asset type. False if unavailable.
-        public static async Task<bool> Apply(string gdir, uint appid, AType t, int steamId, string stamp)
+        // Apply the official Steam default for one asset type. Null if unavailable.
+        public static async Task<ApplyResult> Apply(string gdir, uint appid, AType t, int steamId, string stamp)
         {
             foreach (string f in Files[t.Key])
                 foreach (string cdn in CdnBases)
                 {
-                    try
-                    {
-                        await Artwork.Apply(gdir, appid, t, cdn + steamId + "/" + f, stamp);
-                        return true;
-                    }
+                    try { return await Artwork.Apply(gdir, appid, t, cdn + steamId + "/" + f, stamp); }
                     catch (Exception) { }
                 }
-            return false;
+            return null;
         }
     }
 
     // ------------------------------------------------------- artwork writing
+
+    class ApplyResult
+    {
+        public string Name;                                       // written file name
+        public string NewPath;                                    // full path written
+        public List<string> BackupPaths = new List<string>();     // replaced files, backed up
+    }
 
     static class Artwork
     {
@@ -614,10 +621,11 @@ namespace SteamGridDBFetcher
 
         // Download one asset and write it as the correct grid file.
         // Any replaced files are backed up to backups\<stamp>\ first.
-        public static async Task<string> Apply(string gdir, uint appid, AType t, string url, string stamp)
+        public static async Task<ApplyResult> Apply(string gdir, uint appid, AType t, string url, string stamp)
         {
             byte[] data = await Sgdb.Download(url);
             string target = Path.Combine(gdir, appid + t.Suffix + ExtFromUrl(url));
+            var res = new ApplyResult { NewPath = target, Name = Path.GetFileName(target) };
 
             string bdir = Path.Combine(Cfg.BackupRoot, stamp);
             foreach (string ext in Cfg.ImageExts)
@@ -628,11 +636,12 @@ namespace SteamGridDBFetcher
                     Directory.CreateDirectory(bdir);
                     string bak = Path.Combine(bdir, Path.GetFileName(old));
                     if (!File.Exists(bak)) File.Copy(old, bak);
+                    res.BackupPaths.Add(bak);
                     File.Delete(old);
                 }
             }
             File.WriteAllBytes(target, data);
-            return Path.GetFileName(target);
+            return res;
         }
     }
 
@@ -664,7 +673,6 @@ namespace SteamGridDBFetcher
 
         protected override void WndProc(ref Message m)
         {
-            // hide bars whenever layout/paint/scroll would show them (SB_BOTH=3)
             if (IsHandleCreated &&
                 (m.Msg == 0x05 || m.Msg == 0x0F || m.Msg == 0x83 || m.Msg == 0x85 ||
                  m.Msg == 0x114 || m.Msg == 0x115 || m.Msg == 0x20A))
@@ -703,28 +711,87 @@ namespace SteamGridDBFetcher
         }
     }
 
-    class GameTile
+    // One owner-drawn control per library card (cover + name + slot meter +
+    // status) instead of five child controls - far fewer native windows, so
+    // creation and composited scrolling are much faster.
+    class GameCard : Control
     {
-        public Panel Root;
-        public PictureBox Pic;
-        public Label Name;
-        public Label Status;
+        public Shortcut Game;
+        public Image Cover;          // owned by MainForm caches, not by us
+        public Image Placeholder;
+        public string StatusText = "";
+        public Color StatusColor;
+        public Color NameColor;
+        public bool[] Slots;         // null = all filled (Steam defaults)
+        public Color BgNormal, BgHover, MeterOn, MeterOff;
+        bool hover;
+
+        static readonly Font NameFont = new Font("Segoe UI", 9f, FontStyle.Bold);
+        static readonly Font StatusFont = new Font("Segoe UI", 7.6f);
+
+        public GameCard()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.UserPaint, true);
+            Cursor = Cursors.Hand;
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.Clear(hover ? BgHover : BgNormal);
+            int pad = 4;
+            int cw = Width - pad * 2;
+            int ch = cw * 3 / 2;
+            Image img = Cover != null ? Cover : Placeholder;
+            if (img != null)
+            {
+                try { g.DrawImage(img, pad, pad, cw, ch); }
+                catch (Exception) { }
+            }
+            int y = pad + ch + 6;
+            TextRenderer.DrawText(g, Game != null ? Game.Name : "", NameFont,
+                new Rectangle(pad, y, cw, 17), NameColor,
+                TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            int my = y + 23;
+            for (int i = 0; i < 4; i++)
+            {
+                bool on = Slots == null || (i < Slots.Length && Slots[i]);
+                using (var br = new SolidBrush(on ? MeterOn : MeterOff))
+                    g.FillRectangle(br, pad + i * 23, my + 1, 19, 4);
+            }
+            TextRenderer.DrawText(g, StatusText, StatusFont,
+                new Rectangle(pad + 96, my - 5, cw - 96, 15), StatusColor,
+                TextFormatFlags.Right | TextFormatFlags.NoPrefix);
+        }
+    }
+
+    class Pick
+    {
+        public string Value;        // asset url, or "official:<steamid>"
+        public string SourceLabel;  // "Steam default" / "community" / ...
+        public Panel Tile;
     }
 
     class MainForm : Form
     {
-        // slate neutral ramp (one step per elevation) + Steam-blue accent
-        static readonly Color BG = ColorTranslator.FromHtml("#0F1522");      // window
-        static readonly Color PANEL = ColorTranslator.FromHtml("#1B2434");   // bars, cards
-        static readonly Color PANEL2 = ColorTranslator.FromHtml("#28344A");  // hover / raised
-        static readonly Color FIELD = ColorTranslator.FromHtml("#0B111C");   // inputs, status bar
-        static readonly Color BORDER = ColorTranslator.FromHtml("#2E3A50");  // 1px separators
-        static readonly Color TX = ColorTranslator.FromHtml("#E2E8F0");
-        static readonly Color DIM = ColorTranslator.FromHtml("#94A3B8");
-        static readonly Color ACC = ColorTranslator.FromHtml("#66C0F4");     // interactive/selected only
-        static readonly Color OKC = ColorTranslator.FromHtml("#5FCB71");
-        static readonly Color ERRC = ColorTranslator.FromHtml("#F07878");
-        static readonly Color WARN = ColorTranslator.FromHtml("#E8B44C");
+        // ---- palette (prototype "modern dark" tokens)
+        static readonly Color BG0 = ColorTranslator.FromHtml("#0b0d12");
+        static readonly Color BG1 = ColorTranslator.FromHtml("#10131b");
+        static readonly Color BG2 = ColorTranslator.FromHtml("#161a25");
+        static readonly Color BG3 = ColorTranslator.FromHtml("#1d2230");
+        static readonly Color FIELD = ColorTranslator.FromHtml("#0b0d12");
+        static readonly Color TX = ColorTranslator.FromHtml("#e8ecf4");
+        static readonly Color DIM = ColorTranslator.FromHtml("#8b93a5");
+        static readonly Color ACC = ColorTranslator.FromHtml("#4da3ff");
+        static readonly Color OKC = ColorTranslator.FromHtml("#3fb950");
+        static readonly Color WARN = ColorTranslator.FromHtml("#d4a24e");
+        static readonly Color ERRC = ColorTranslator.FromHtml("#e5534b");
+        static readonly Color NSFWB = ColorTranslator.FromHtml("#c0392f");   // adult-content tile border
+        static readonly Color METER_OFF = ColorTranslator.FromHtml("#2a3040");
 
         const int CoverW = 220, CoverH = 330;
 
@@ -732,57 +799,79 @@ namespace SteamGridDBFetcher
         Sgdb api;
         string steamPath, userId, gridDir, stamp;
         List<Shortcut> shortcuts;
-
-        // library view
-        Panel libraryView;
-        FlowLayoutPanel libraryFlow;
-        Label profileLabel;
-        Button autoAllBtn, refreshBtn, filterBtn;
-        TextBox filterBox;
-        CheckBox steamBox;
         List<Shortcut> steamGames = new List<Shortcut>();
-        int libGen;   // invalidates in-flight Steam cover downloads on rebuild
-        readonly Dictionary<uint, GameTile> gameTiles = new Dictionary<uint, GameTile>();
-        readonly Dictionary<uint, Image> coverImages = new Dictionary<uint, Image>();
-        readonly Dictionary<uint, Image> placeholders = new Dictionary<uint, Image>();
-        readonly Dictionary<uint, Image> steamCoverCache = new Dictionary<uint, Image>();
 
-        IEnumerable<Shortcut> DisplayGames
+        IEnumerable<Shortcut> AllGames
         {
             get { return steamGames.Count > 0 ? shortcuts.Concat(steamGames) : (IEnumerable<Shortcut>)shortcuts; }
         }
 
-        // picker view
-        Panel pickerView;
-        Panel pickerHeader;
-        Button backBtn, searchBtn, applyBtn, autoBtn;
-        TextBox searchBox;
+        // per-game slot state (cover/wide/background/logo custom files present)
+        readonly Dictionary<uint, bool[]> slotState = new Dictionary<uint, bool[]>();
+        readonly HashSet<uint> applied = new HashSet<uint>();
+
+        // ---- library view
+        Panel libraryView;
+        FlowLayoutPanel libraryFlow;
+        Panel scopeSeg;
+        readonly List<Button> scopeButtons = new List<Button>();
+        readonly string[] scopeKeys = new string[] { "all", "missing", "nonsteam", "steam" };
+        readonly string[] scopeLabels = new string[] { "All", "Missing art", "Non-Steam", "Steam" };
+        string scope = "all";
+        TextBox libSearch;
+        Button refreshBtn, fillBtn;
+        Panel batchStrip;
+        Label batchLabel, batchTxt;
+        Panel batchBarOuter, batchBarInner;
+        System.Windows.Forms.Timer stripHideTimer;
+        readonly Dictionary<uint, GameCard> gameTiles = new Dictionary<uint, GameCard>();
+        readonly Dictionary<uint, Image> coverImages = new Dictionary<uint, Image>();
+        readonly Dictionary<uint, Image> placeholders = new Dictionary<uint, Image>();
+        readonly Dictionary<uint, Image> steamCoverCache = new Dictionary<uint, Image>();
+        int libGen;
+
+        // ---- detail view
+        Panel detailView;
+        Button backBtn, applyBtn, autoFillBtn;
+        PictureBox heroPb;
+        Image heroOwned;                 // hero image loaded from disk (we own it)
+        Label dName, stagedLabel, railStatus;
+        LinkLabel undoLink;
         ComboBox matchCombo;
-        Label selLabel, gameTitle;
+        TextBox dSearch;
+        readonly Dictionary<string, Label> chkDot = new Dictionary<string, Label>();
+        readonly Dictionary<string, Label> chkStatus = new Dictionary<string, Label>();
         Panel contentPanel;
         FlowLayoutPanel sectionsFlow;
         CheckBox cbStatic, cbAnimated, cbHumor, cbAdult, cbEpilepsy, cbUntagged;
         bool suppressFilter;
-        readonly Dictionary<Panel, SgdbAsset> tileAssets = new Dictionary<Panel, SgdbAsset>();
 
-        Label statusLabel;
-
+        // picker state
         readonly Dictionary<string, FlowLayoutPanel> flows = new Dictionary<string, FlowLayoutPanel>();
         readonly Dictionary<string, Label> countLabels = new Dictionary<string, Label>();
         readonly Dictionary<string, int> pageByType = new Dictionary<string, int>();
         readonly Dictionary<string, int> totalByType = new Dictionary<string, int>();
         readonly Dictionary<string, int> shownByType = new Dictionary<string, int>();
         readonly Dictionary<string, List<Panel>> tiles = new Dictionary<string, List<Panel>>();
-        readonly Dictionary<string, string> sel = new Dictionary<string, string>();
-        readonly Dictionary<string, Label> selBadges = new Dictionary<string, Label>();
-        readonly HashSet<uint> applied = new HashSet<uint>();
+        readonly Dictionary<Panel, SgdbAsset> tileAssets = new Dictionary<Panel, SgdbAsset>();
+        readonly Dictionary<string, Panel> currentTiles = new Dictionary<string, Panel>();
+        readonly Dictionary<string, Panel> officialTiles = new Dictionary<string, Panel>();
+        readonly Dictionary<string, Pick> staged = new Dictionary<string, Pick>();
         readonly List<SgdbGame> matches = new List<SgdbGame>();
         readonly SemaphoreSlim thumbSem = new SemaphoreSlim(6);
+        List<UndoItem> lastUndo;
+        uint lastUndoApp;
+
+        class UndoItem
+        {
+            public AType Type;
+            public List<string> BackupPaths;
+        }
 
         Shortcut currentShortcut;
-        int gen;                 // invalidates in-flight loads
+        int gen;
         int currentSgdbId = -1;
-        bool busy, suppressMatch, suppressSteamBox;
+        bool busy, suppressMatch;
 
         [DllImport("dwmapi.dll")]
         static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
@@ -790,13 +879,13 @@ namespace SteamGridDBFetcher
         public MainForm()
         {
             Text = "SteamGridDB Fetcher";
-            BackColor = BG;
+            BackColor = BG0;
             ForeColor = TX;
             Font = new Font("Segoe UI", 9f);
             AutoScaleDimensions = new SizeF(96f, 96f);
-            AutoScaleMode = AutoScaleMode.Dpi;   // scale all fixed sizes with display DPI
-            ClientSize = new Size(1280, 840);
-            MinimumSize = new Size(1000, 640);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            ClientSize = new Size(1320, 860);
+            MinimumSize = new Size(1060, 660);
             StartPosition = FormStartPosition.CenterScreen;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
             catch (Exception) { }
@@ -806,7 +895,15 @@ namespace SteamGridDBFetcher
             FormClosing += SaveWindowState;
         }
 
-        // remember window size between runs (saved in config.json)
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            try { int on = 1; DwmSetWindowAttribute(Handle, 20, ref on, 4); }  // dark title bar
+            catch (Exception) { }
+        }
+
+        // ------------------------------------------------- window persistence
+
         void RestoreWindowState()
         {
             int ww = Cfg.Int(cfg, "win_w", 0), wh = Cfg.Int(cfg, "win_h", 0);
@@ -835,13 +932,6 @@ namespace SteamGridDBFetcher
             catch (Exception) { }
         }
 
-        protected override void OnHandleCreated(EventArgs e)
-        {
-            base.OnHandleCreated(e);
-            try { int on = 1; DwmSetWindowAttribute(Handle, 20, ref on, 4); }  // dark title bar
-            catch (Exception) { }
-        }
-
         // ------------------------------------------------------------- setup
 
         void OnShownAsync(object s, EventArgs e)
@@ -864,13 +954,20 @@ namespace SteamGridDBFetcher
                 steamPath = Steam.FindPath(cfg);
                 stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
 
-                suppressSteamBox = true;
-                steamBox.Checked = Cfg.Int(cfg, "show_steam", 0) == 1;
-                suppressSteamBox = false;
-                LoadFilters();
+                // restore persisted scope + filters
+                scope = Cfg.Str(cfg, "scope") ?? "all";
+                if (!scopeKeys.Contains(scope)) scope = "all";
+                suppressFilter = true;
+                cbStatic.Checked = Cfg.Int(cfg, "f_static", 1) == 1;
+                cbAnimated.Checked = Cfg.Int(cfg, "f_animated", 1) == 1;
+                cbHumor.Checked = Cfg.Int(cfg, "f_humor", 1) == 1;
+                cbAdult.Checked = Cfg.Int(cfg, "f_adult", 1) == 1;
+                cbEpilepsy.Checked = Cfg.Int(cfg, "f_epilepsy", 1) == 1;
+                cbUntagged.Checked = Cfg.Int(cfg, "f_untagged", 1) == 1;
+                suppressFilter = false;
+
                 ReloadLibrary();
-                UpdateButtons();   // enables Auto-apply ALL right away
-                SetStatus("Ready. Click a game to pick its artwork.", DIM);
+                UpdateButtons();
             }
             catch (Exception ex)
             {
@@ -885,7 +982,7 @@ namespace SteamGridDBFetcher
             using (var f = new Form())
             {
                 f.Text = "SteamGridDB API key";
-                f.BackColor = BG; f.ForeColor = TX; f.Font = Font;
+                f.BackColor = BG0; f.ForeColor = TX; f.Font = Font;
                 f.AutoScaleDimensions = new SizeF(96f, 96f);
                 f.AutoScaleMode = AutoScaleMode.Dpi;
                 f.FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -904,10 +1001,10 @@ namespace SteamGridDBFetcher
                     BackColor = FIELD, ForeColor = TX, BorderStyle = BorderStyle.FixedSingle
                 };
                 var ok = MakeButton("OK", true);
-                ok.Location = new Point(254, 104); ok.Size = new Size(90, 30); ok.AutoSize = false;
+                ok.Location = new Point(254, 104); ok.Size = new Size(90, 32); ok.AutoSize = false;
                 ok.DialogResult = DialogResult.OK;
                 var cancel = MakeButton("Cancel", false);
-                cancel.Location = new Point(354, 104); cancel.Size = new Size(90, 30); cancel.AutoSize = false;
+                cancel.Location = new Point(354, 104); cancel.Size = new Size(90, 32); cancel.AutoSize = false;
                 cancel.DialogResult = DialogResult.Cancel;
                 f.Controls.Add(lbl); f.Controls.Add(box); f.Controls.Add(ok); f.Controls.Add(cancel);
                 f.AcceptButton = ok; f.CancelButton = cancel;
@@ -915,7 +1012,7 @@ namespace SteamGridDBFetcher
             }
         }
 
-        // ---------------------------------------------------------------- ui
+        // ------------------------------------------------------- ui helpers
 
         Button MakeButton(string text, bool accent)
         {
@@ -923,8 +1020,8 @@ namespace SteamGridDBFetcher
             {
                 Text = text,
                 FlatStyle = FlatStyle.Flat,
-                BackColor = accent ? ACC : PANEL2,
-                ForeColor = accent ? ColorTranslator.FromHtml("#06121C") : TX,
+                BackColor = accent ? ACC : BG3,
+                ForeColor = accent ? ColorTranslator.FromHtml("#06121f") : TX,
                 Font = new Font("Segoe UI", 9f, FontStyle.Bold),
                 Cursor = Cursors.Hand,
                 AutoSize = true,
@@ -932,200 +1029,200 @@ namespace SteamGridDBFetcher
                 Padding = new Padding(14, 7, 14, 7)
             };
             b.FlatAppearance.BorderSize = 0;
-            b.FlatAppearance.MouseOverBackColor = accent ? ColorTranslator.FromHtml("#8AD0F8") : ColorTranslator.FromHtml("#324058");
-            b.FlatAppearance.MouseDownBackColor = accent ? ColorTranslator.FromHtml("#4FAEE8") : ColorTranslator.FromHtml("#1F2A3D");
+            b.FlatAppearance.MouseOverBackColor = accent ? ColorTranslator.FromHtml("#6cb4ff") : ColorTranslator.FromHtml("#242b3d");
             return b;
         }
 
+        CheckBox MakeCheck(string text)
+        {
+            return new CheckBox
+            {
+                Text = text, Checked = true, AutoSize = true,
+                ForeColor = TX, BackColor = BG1, Cursor = Cursors.Hand,
+                Margin = new Padding(0, 5, 14, 0)
+            };
+        }
+
+        Label RailHeading(string text)
+        {
+            return new Label
+            {
+                Text = text.ToUpperInvariant(), ForeColor = DIM, BackColor = BG1,
+                Font = new Font("Segoe UI", 7.8f, FontStyle.Bold), AutoSize = true,
+                Margin = new Padding(0, 10, 0, 4)
+            };
+        }
+
+        Label FilterHeading(string text, int leftGap)
+        {
+            return new Label
+            {
+                Text = text.ToUpperInvariant(), ForeColor = DIM, BackColor = BG1, AutoSize = true,
+                Font = new Font("Segoe UI", 7.8f, FontStyle.Bold),
+                Margin = new Padding(leftGap, 9, 10, 0)
+            };
+        }
+
+        // ---------------------------------------------------------- build ui
+
         void BuildUi()
         {
-            var statusBar = new Panel { Dock = DockStyle.Bottom, Height = 37, BackColor = FIELD };
-            statusLabel = new Label
-            {
-                Dock = DockStyle.Fill, BackColor = FIELD, ForeColor = DIM,
-                TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(16, 0, 0, 0),
-                Text = "Starting..."
-            };
-            statusBar.Controls.Add(statusLabel);
-            statusBar.Controls.Add(new Panel { Dock = DockStyle.Top, Height = 1, BackColor = BORDER });
-            Controls.Add(statusBar);
-
-            // ------------------------------------------------- library view
-            libraryView = new Panel { Dock = DockStyle.Fill, BackColor = BG };
+            // ============================================= LIBRARY VIEW
+            libraryView = new Panel { Dock = DockStyle.Fill, BackColor = BG0 };
             Controls.Add(libraryView);
             libraryView.BringToFront();
 
-            var topBar = new Panel { Dock = DockStyle.Top, Height = 64, BackColor = PANEL };
-            libraryView.Controls.Add(topBar);
+            var toolbar = new Panel { Dock = DockStyle.Top, Height = 66, BackColor = BG1 };
+            libraryView.Controls.Add(toolbar);
 
-            var title = new Label
+            var brand = new Label
             {
-                Text = "SteamGridDB Fetcher", ForeColor = TX, BackColor = PANEL,
-                Font = new Font("Segoe UI", 13f, FontStyle.Bold),
-                Location = new Point(16, 10), AutoSize = true
+                Text = "SteamGridDB Fetcher", ForeColor = TX, BackColor = BG1,
+                Font = new Font("Segoe UI", 12f, FontStyle.Bold),
+                Location = new Point(18, 20), AutoSize = true
             };
-            topBar.Controls.Add(title);
+            toolbar.Controls.Add(brand);
 
-            profileLabel = new Label
+            scopeSeg = new Panel { Location = new Point(240, 15), Height = 36, BackColor = BG0, Width = 480 };
+            toolbar.Controls.Add(scopeSeg);
+            for (int i = 0; i < scopeKeys.Length; i++)
             {
-                Text = "", ForeColor = DIM, BackColor = PANEL,
-                Font = new Font("Segoe UI", 8.5f),
-                Location = new Point(16, 38), AutoSize = true
-            };
-            topBar.Controls.Add(profileLabel);
+                string key = scopeKeys[i];
+                var b = new Button
+                {
+                    Text = scopeLabels[i], FlatStyle = FlatStyle.Flat, ForeColor = DIM,
+                    BackColor = BG0, Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+                    AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                    Padding = new Padding(10, 6, 10, 6), Cursor = Cursors.Hand,
+                    Location = new Point(3, 3), Tag = key
+                };
+                b.FlatAppearance.BorderSize = 0;
+                b.FlatAppearance.MouseOverBackColor = BG2;
+                b.Click += delegate
+                {
+                    if (busy) return;
+                    scope = key;
+                    cfg["scope"] = scope;
+                    Cfg.Save(cfg);
+                    RenderScopeSeg();
+                    ApplyLibraryFilter();
+                };
+                scopeSeg.Controls.Add(b);
+                scopeButtons.Add(b);
+            }
 
             var tools = new FlowLayoutPanel
             {
                 Dock = DockStyle.Right, AutoSize = true, WrapContents = false,
-                FlowDirection = FlowDirection.LeftToRight, BackColor = PANEL,
-                Padding = new Padding(0, 15, 16, 0)
+                FlowDirection = FlowDirection.LeftToRight, BackColor = BG1,
+                Padding = new Padding(0, 15, 14, 0)
             };
-            topBar.Controls.Add(tools);
-            topBar.Controls.Add(new Panel { Dock = DockStyle.Bottom, Height = 1, BackColor = BORDER });
+            toolbar.Controls.Add(tools);
 
-            steamBox = new CheckBox
+            libSearch = new TextBox
             {
-                Text = "Show Steam games", ForeColor = TX, BackColor = PANEL,
-                AutoSize = true, Margin = new Padding(0, 8, 12, 0), Cursor = Cursors.Hand
-            };
-            steamBox.CheckedChanged += delegate
-            {
-                if (suppressSteamBox) return;
-                cfg["show_steam"] = steamBox.Checked ? 1 : 0;
-                Cfg.Save(cfg);
-                RefreshLibrary();
-            };
-            tools.Controls.Add(steamBox);
-
-            filterBox = new TextBox
-            {
-                Width = 210, BackColor = FIELD, ForeColor = TX,
+                Width = 220, BackColor = FIELD, ForeColor = TX,
                 BorderStyle = BorderStyle.FixedSingle, Font = new Font("Segoe UI", 10f),
-                Margin = new Padding(0, 5, 8, 0)
+                Margin = new Padding(0, 5, 10, 0)
             };
-            filterBox.TextChanged += delegate { ApplyFilter(); };
-            filterBox.KeyDown += delegate(object s, KeyEventArgs e)
-            {
-                if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; ApplyFilter(); }
-            };
-            tools.Controls.Add(filterBox);
-
-            filterBtn = MakeButton("Search", false);
-            filterBtn.Margin = new Padding(0, 0, 8, 0);
-            filterBtn.Click += delegate { ApplyFilter(); };
-            tools.Controls.Add(filterBtn);
+            libSearch.TextChanged += delegate { ApplyLibraryFilter(); };
+            tools.Controls.Add(libSearch);
 
             refreshBtn = MakeButton("Refresh", false);
-            refreshBtn.Margin = new Padding(0, 0, 8, 0);
+            refreshBtn.Margin = new Padding(0, 0, 10, 0);
             refreshBtn.Click += delegate { RefreshLibrary(); };
             tools.Controls.Add(refreshBtn);
 
-            autoAllBtn = MakeButton("Auto-apply ALL games", false);
-            autoAllBtn.Margin = new Padding(0);
-            autoAllBtn.Click += delegate { AutoAll(); };
-            tools.Controls.Add(autoAllBtn);
+            fillBtn = MakeButton("Fill missing art", true);
+            fillBtn.Margin = new Padding(0);
+            fillBtn.Click += delegate { FillMissing(); };
+            tools.Controls.Add(fillBtn);
+
+            batchStrip = new Panel { Dock = DockStyle.Top, Height = 40, BackColor = BG1, Visible = false };
+            libraryView.Controls.Add(batchStrip);
+            batchStrip.BringToFront();
+            batchLabel = new Label
+            {
+                Text = "", ForeColor = TX, BackColor = BG1, AutoSize = false,
+                Location = new Point(18, 10), Size = new Size(560, 20),
+                AutoEllipsis = true
+            };
+            batchStrip.Controls.Add(batchLabel);
+            batchTxt = new Label
+            {
+                Text = "", ForeColor = DIM, BackColor = BG1, AutoSize = true,
+                Anchor = AnchorStyles.Top | AnchorStyles.Right,
+                Location = new Point(batchStrip.Width - 100, 12)
+            };
+            batchStrip.Controls.Add(batchTxt);
+            batchBarOuter = new Panel
+            {
+                Location = new Point(600, 16), Height = 7, BackColor = BG3,
+                Width = Math.Max(120, batchStrip.Width - 720),
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+            };
+            batchStrip.Controls.Add(batchBarOuter);
+            batchBarInner = new Panel { Location = new Point(0, 0), Height = 7, Width = 0, BackColor = ACC };
+            batchBarOuter.Controls.Add(batchBarInner);
+
+            stripHideTimer = new System.Windows.Forms.Timer { Interval = 3500 };
+            stripHideTimer.Tick += delegate { stripHideTimer.Stop(); batchStrip.Visible = false; };
 
             libraryFlow = new BareFlowPanel
             {
-                Dock = DockStyle.Fill, AutoScroll = true, BackColor = BG,
-                Padding = new Padding(16, 12, 16, 12)
+                Dock = DockStyle.Fill, AutoScroll = true, BackColor = BG0,
+                Padding = new Padding(14, 12, 14, 12)
             };
             libraryView.Controls.Add(libraryFlow);
             libraryFlow.BringToFront();
 
-            // -------------------------------------------------- picker view
-            pickerView = new Panel { Dock = DockStyle.Fill, BackColor = BG, Visible = false };
-            Controls.Add(pickerView);
-            pickerView.BringToFront();
+            // ============================================= DETAIL VIEW
+            detailView = new Panel { Dock = DockStyle.Fill, BackColor = BG0, Visible = false };
+            Controls.Add(detailView);
+            detailView.BringToFront();
 
-            // header: every picker control lives in one auto-sized docked
-            // stack, so rows grow with content and nothing can overlap
-            pickerHeader = new Panel
+            var rail = new BarePanel
             {
-                Dock = DockStyle.Top, BackColor = PANEL,
-                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink
+                Dock = DockStyle.Left, Width = 306, BackColor = BG1, AutoScroll = true
             };
-            pickerView.Controls.Add(pickerHeader);
+            detailView.Controls.Add(rail);
 
-            // border first: added earlier = docked later = below the stack
-            pickerHeader.Controls.Add(new Panel { Dock = DockStyle.Top, Height = 1, BackColor = BORDER });
-
-            var headerStack = new TableLayoutPanel
+            var railFlow = new FlowLayoutPanel
             {
-                Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                BackColor = PANEL, ColumnCount = 1, Padding = new Padding(16, 10, 16, 12)
-            };
-            headerStack.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            pickerHeader.Controls.Add(headerStack);
-
-            var titleRow = new FlowLayoutPanel
-            {
+                FlowDirection = FlowDirection.TopDown, WrapContents = false,
                 AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                WrapContents = true, BackColor = PANEL, Dock = DockStyle.Fill,
-                Margin = new Padding(0)
+                BackColor = BG1, Location = new Point(16, 14)
             };
-            headerStack.Controls.Add(titleRow);
+            rail.Controls.Add(railFlow);
 
             backBtn = MakeButton("<   Library", false);
-            backBtn.Margin = new Padding(0, 0, 12, 0);
+            backBtn.Margin = new Padding(0, 0, 0, 14);
             backBtn.Click += delegate { BackToLibrary(); };
-            titleRow.Controls.Add(backBtn);
+            railFlow.Controls.Add(backBtn);
 
-            gameTitle = new Label
+            var heroWrap = new Panel { Size = new Size(272, 280), BackColor = BG1, Margin = new Padding(0, 0, 0, 8) };
+            heroPb = new PictureBox
             {
-                Text = "", ForeColor = TX, BackColor = PANEL,
+                Location = new Point(44, 0), Size = new Size(184, 276),
+                SizeMode = PictureBoxSizeMode.Zoom, BackColor = BG2
+            };
+            heroWrap.Controls.Add(heroPb);
+            railFlow.Controls.Add(heroWrap);
+
+            dName = new Label
+            {
+                Text = "", ForeColor = TX, BackColor = BG1,
                 Font = new Font("Segoe UI", 12f, FontStyle.Bold),
-                AutoSize = true, Margin = new Padding(0, 5, 0, 0)
+                AutoSize = true, MaximumSize = new Size(272, 0),
+                Margin = new Padding(0, 0, 0, 6)
             };
-            titleRow.Controls.Add(gameTitle);
+            railFlow.Controls.Add(dName);
 
-            var searchRow = new TableLayoutPanel
-            {
-                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                Dock = DockStyle.Fill, BackColor = PANEL, ColumnCount = 2,
-                Margin = new Padding(0, 8, 0, 0)
-            };
-            searchRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            searchRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            headerStack.Controls.Add(searchRow);
-
-            searchBox = new TextBox
-            {
-                Anchor = AnchorStyles.Left | AnchorStyles.Right,
-                BackColor = FIELD, ForeColor = TX, BorderStyle = BorderStyle.FixedSingle,
-                Font = new Font("Segoe UI", 10f), Margin = new Padding(0, 0, 8, 0)
-            };
-            searchBox.KeyDown += delegate(object s, KeyEventArgs e)
-            {
-                if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; DoSearch(); }
-            };
-            searchRow.Controls.Add(searchBox, 0, 0);
-
-            searchBtn = MakeButton("Search", true);
-            searchBtn.Margin = new Padding(0);
-            searchBtn.Click += delegate { DoSearch(); };
-            searchRow.Controls.Add(searchBtn, 1, 0);
-
-            var matchRow = new FlowLayoutPanel
-            {
-                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                WrapContents = false, BackColor = PANEL, Dock = DockStyle.Fill,
-                Margin = new Padding(0, 8, 0, 0)
-            };
-            headerStack.Controls.Add(matchRow);
-
-            var matchLbl = new Label
-            {
-                Text = "Match:", ForeColor = DIM, BackColor = PANEL,
-                AutoSize = true, Margin = new Padding(0, 6, 8, 0)
-            };
-            matchRow.Controls.Add(matchLbl);
-
+            railFlow.Controls.Add(RailHeading("SteamGridDB match"));
             matchCombo = new ComboBox
             {
-                Size = new Size(420, 26),
-                DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat,
-                BackColor = PANEL2, ForeColor = TX, Margin = new Padding(0)
+                Width = 272, DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat,
+                BackColor = BG2, ForeColor = TX, Margin = new Padding(0)
             };
             matchCombo.SelectedIndexChanged += delegate
             {
@@ -1133,25 +1230,111 @@ namespace SteamGridDBFetcher
                 if (matchCombo.SelectedIndex < matches.Count)
                     LoadAssets(matches[matchCombo.SelectedIndex].Id, matches[matchCombo.SelectedIndex].Name);
             };
-            matchRow.Controls.Add(matchCombo);
+            railFlow.Controls.Add(matchCombo);
 
-            // type/tag filters, mirroring the SteamGridDB site (all on = show everything)
+            railFlow.Controls.Add(RailHeading("Search override"));
+            dSearch = new TextBox
+            {
+                Width = 272, BackColor = FIELD, ForeColor = TX,
+                BorderStyle = BorderStyle.FixedSingle, Font = new Font("Segoe UI", 10f),
+                Margin = new Padding(0)
+            };
+            dSearch.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; DoSearch(); }
+            };
+            railFlow.Controls.Add(dSearch);
+
+            railFlow.Controls.Add(RailHeading("Artwork slots"));
+            foreach (AType t in Cfg.Types)
+            {
+                var row = new Panel { Size = new Size(272, 32), BackColor = BG2, Margin = new Padding(0, 0, 0, 5) };
+                var dot = new Label
+                {
+                    Text = "●", AutoSize = true, BackColor = BG2, ForeColor = DIM,
+                    Font = new Font("Segoe UI", 8f), Location = new Point(10, 8)
+                };
+                var nm = new Label
+                {
+                    Text = t.Short, AutoSize = true, BackColor = BG2, ForeColor = TX,
+                    Location = new Point(30, 7)
+                };
+                var st = new Label
+                {
+                    Text = "", AutoSize = false, BackColor = BG2, ForeColor = DIM,
+                    Size = new Size(110, 18), Location = new Point(152, 7),
+                    TextAlign = ContentAlignment.MiddleRight,
+                    Font = new Font("Segoe UI", 8.2f, FontStyle.Bold)
+                };
+                row.Controls.Add(dot); row.Controls.Add(nm); row.Controls.Add(st);
+                chkDot[t.Key] = dot;
+                chkStatus[t.Key] = st;
+                railFlow.Controls.Add(row);
+            }
+
+            railFlow.Controls.Add(RailHeading("Staged changes"));
+            stagedLabel = new Label
+            {
+                Text = "", ForeColor = DIM, BackColor = BG2, AutoSize = true,
+                MaximumSize = new Size(272, 0), MinimumSize = new Size(272, 40),
+                Padding = new Padding(10, 8, 10, 8), Margin = new Padding(0, 0, 0, 10)
+            };
+            railFlow.Controls.Add(stagedLabel);
+
+            applyBtn = MakeButton("Apply changes", true);
+            applyBtn.AutoSize = false;
+            applyBtn.Size = new Size(272, 38);
+            applyBtn.Margin = new Padding(0, 0, 0, 8);
+            applyBtn.Click += delegate { ApplyStaged(); };
+            railFlow.Controls.Add(applyBtn);
+
+            autoFillBtn = MakeButton("Auto-fill empty slots", false);
+            autoFillBtn.AutoSize = false;
+            autoFillBtn.Size = new Size(272, 34);
+            autoFillBtn.Margin = new Padding(0, 0, 0, 8);
+            autoFillBtn.Click += delegate { AutoFillEmpty(); };
+            railFlow.Controls.Add(autoFillBtn);
+
+            railStatus = new Label
+            {
+                Text = "", ForeColor = DIM, BackColor = BG1, AutoSize = true,
+                MaximumSize = new Size(272, 0), Margin = new Padding(0, 0, 0, 2),
+                Font = new Font("Segoe UI", 8.6f)
+            };
+            railFlow.Controls.Add(railStatus);
+
+            undoLink = new LinkLabel
+            {
+                Text = "Undo last apply", AutoSize = true, Visible = false,
+                LinkColor = ACC, ActiveLinkColor = TX, BackColor = BG1,
+                Font = new Font("Segoe UI", 8.8f, FontStyle.Bold),
+                Margin = new Padding(0, 2, 0, 16)
+            };
+            undoLink.LinkClicked += delegate { UndoLast(); };
+            railFlow.Controls.Add(undoLink);
+
+            // workarea (filters + sections)
+            var work = new Panel { Dock = DockStyle.Fill, BackColor = BG0 };
+            detailView.Controls.Add(work);
+            work.BringToFront();
+
+            var filterbar = new Panel { Dock = DockStyle.Top, Height = 46, BackColor = BG1 };
+            work.Controls.Add(filterbar);
             var filterRow = new FlowLayoutPanel
             {
-                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                WrapContents = true, BackColor = PANEL, Dock = DockStyle.Fill,
-                FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0, 8, 0, 0)
+                Location = new Point(12, 8), AutoSize = true, WrapContents = false,
+                BackColor = BG1, FlowDirection = FlowDirection.LeftToRight
             };
-            headerStack.Controls.Add(filterRow);
+            filterbar.Controls.Add(filterRow);
 
-            filterRow.Controls.Add(FilterHeading("Types", 0));
+            filterRow.Controls.Add(FilterHeading("Type", 4));
             cbStatic = MakeCheck("Static");
             cbAnimated = MakeCheck("Animated");
             filterRow.Controls.Add(cbStatic);
             filterRow.Controls.Add(cbAnimated);
-            filterRow.Controls.Add(FilterHeading("Tags", 16));
+            filterRow.Controls.Add(FilterHeading("Tags", 18));
             cbHumor = MakeCheck("Humor");
-            cbAdult = MakeCheck("Adult Content");
+            cbAdult = MakeCheck("Adult");
             cbEpilepsy = MakeCheck("Epilepsy");
             cbUntagged = MakeCheck("Untagged");
             filterRow.Controls.Add(cbHumor);
@@ -1159,8 +1342,8 @@ namespace SteamGridDBFetcher
             filterRow.Controls.Add(cbEpilepsy);
             filterRow.Controls.Add(cbUntagged);
 
-            var allBtn = MakeButton("All", false);
-            allBtn.Margin = new Padding(16, 0, 0, 0);
+            var allBtn = MakeButton("Reset", false);
+            allBtn.Margin = new Padding(14, 0, 0, 0);
             allBtn.Click += delegate
             {
                 suppressFilter = true;
@@ -1178,43 +1361,18 @@ namespace SteamGridDBFetcher
                     ApplyAssetFilter();
                 };
 
-            var actionRow = new FlowLayoutPanel
-            {
-                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                WrapContents = true, BackColor = PANEL, Dock = DockStyle.Fill,
-                Margin = new Padding(0, 12, 0, 0)
-            };
-            headerStack.Controls.Add(actionRow);
-
-            applyBtn = MakeButton("Apply selected", true);
-            applyBtn.Margin = new Padding(0, 0, 8, 0);
-            applyBtn.Click += delegate { ApplySelected(); };
-            actionRow.Controls.Add(applyBtn);
-
-            autoBtn = MakeButton("Auto (top picks)", false);
-            autoBtn.Margin = new Padding(0, 0, 12, 0);
-            autoBtn.Click += delegate { AutoOne(); };
-            actionRow.Controls.Add(autoBtn);
-
-            selLabel = new Label
-            {
-                Text = "", ForeColor = DIM, BackColor = PANEL,
-                AutoSize = true, Margin = new Padding(0, 8, 0, 0)
-            };
-            actionRow.Controls.Add(selLabel);
-
             contentPanel = new BarePanel
             {
-                Dock = DockStyle.Fill, BackColor = BG, AutoScroll = true
+                Dock = DockStyle.Fill, BackColor = BG0, AutoScroll = true, Padding = new Padding(6)
             };
-            pickerView.Controls.Add(contentPanel);
+            work.Controls.Add(contentPanel);
             contentPanel.BringToFront();
 
             sectionsFlow = new FlowLayoutPanel
             {
                 FlowDirection = FlowDirection.TopDown, WrapContents = false,
                 AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                BackColor = BG, Location = new Point(16, 4)
+                BackColor = BG0, Location = new Point(10, 4)
             };
             contentPanel.Controls.Add(sectionsFlow);
             contentPanel.Resize += delegate { UpdateFlowWidths(); };
@@ -1222,28 +1380,6 @@ namespace SteamGridDBFetcher
             var animTimer = new System.Windows.Forms.Timer { Interval = 30 };
             animTimer.Tick += delegate { AnimTick(); };
             animTimer.Start();
-
-            UpdateButtons();
-        }
-
-        Label FilterHeading(string text, int leftGap)
-        {
-            return new Label
-            {
-                Text = text, ForeColor = DIM, BackColor = PANEL, AutoSize = true,
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
-                Margin = new Padding(leftGap, 7, 10, 0)
-            };
-        }
-
-        CheckBox MakeCheck(string text)
-        {
-            return new CheckBox
-            {
-                Text = text, Checked = true, AutoSize = true,
-                ForeColor = TX, BackColor = PANEL, Cursor = Cursors.Hand,
-                Margin = new Padding(0, 4, 12, 0)
-            };
         }
 
         CheckBox[] AllFilterBoxes()
@@ -1251,88 +1387,263 @@ namespace SteamGridDBFetcher
             return new CheckBox[] { cbStatic, cbAnimated, cbHumor, cbAdult, cbEpilepsy, cbUntagged };
         }
 
-        // the type/tag filters are global and persist between runs (config.json)
-        static readonly string[] FilterKeys = new string[]
-            { "f_static", "f_animated", "f_humor", "f_adult", "f_epilepsy", "f_untagged" };
-
-        void LoadFilters()
-        {
-            suppressFilter = true;
-            CheckBox[] boxes = AllFilterBoxes();
-            for (int i = 0; i < boxes.Length; i++)
-                boxes[i].Checked = Cfg.Int(cfg, FilterKeys[i], 1) == 1;
-            suppressFilter = false;
-        }
-
         void SaveFilters()
         {
-            if (cfg == null) return;
-            CheckBox[] boxes = AllFilterBoxes();
-            for (int i = 0; i < boxes.Length; i++)
-                cfg[FilterKeys[i]] = boxes[i].Checked ? 1 : 0;
+            cfg["f_static"] = cbStatic.Checked ? 1 : 0;
+            cfg["f_animated"] = cbAnimated.Checked ? 1 : 0;
+            cfg["f_humor"] = cbHumor.Checked ? 1 : 0;
+            cfg["f_adult"] = cbAdult.Checked ? 1 : 0;
+            cfg["f_epilepsy"] = cbEpilepsy.Checked ? 1 : 0;
+            cfg["f_untagged"] = cbUntagged.Checked ? 1 : 0;
             Cfg.Save(cfg);
-        }
-
-        bool ShouldShow(SgdbAsset a)
-        {
-            bool typeOk = a.Animated ? cbAnimated.Checked : cbStatic.Checked;
-            bool tagged = a.Nsfw || a.Humor || a.Epilepsy;
-            bool tagOk = tagged
-                ? (a.Nsfw && cbAdult.Checked) || (a.Humor && cbHumor.Checked) ||
-                  (a.Epilepsy && cbEpilepsy.Checked)
-                : cbUntagged.Checked;
-            return typeOk && tagOk;
-        }
-
-        // Show/hide asset tiles per the type/tag filters (current, Steam
-        // default and Load-more tiles always stay visible).
-        void ApplyAssetFilter()
-        {
-            foreach (var kv in tiles)
-            {
-                foreach (Panel p in kv.Value)
-                {
-                    SgdbAsset a;
-                    if (!p.IsDisposed && tileAssets.TryGetValue(p, out a))
-                        p.Visible = ShouldShow(a);
-                }
-                // if the selected pick just got hidden, fall back to "current"
-                string selUrl;
-                if (sel.TryGetValue(kv.Key, out selUrl))
-                {
-                    Panel selTile = kv.Value.FirstOrDefault(
-                        p => !p.IsDisposed && (p.Tag as string) == selUrl);
-                    if (selTile != null && !selTile.Visible && kv.Value.Count > 0)
-                        SelectTile(kv.Key, kv.Value[0], null);
-                }
-            }
         }
 
         void UpdateFlowWidths()
         {
-            int w = Math.Max(300, contentPanel.ClientSize.Width - 48);
+            int w = Math.Max(300, contentPanel.ClientSize.Width - 34);
             foreach (var f in flows.Values) f.MaximumSize = new Size(w, 0);
-        }
-
-        void SetStatus(string text, Color c)
-        {
-            statusLabel.Text = text;
-            statusLabel.ForeColor = c;
         }
 
         void UpdateButtons()
         {
-            applyBtn.Enabled = !busy && sel.Count > 0;
-            autoBtn.Enabled = !busy && currentSgdbId > 0;
-            autoAllBtn.Enabled = !busy && shortcuts != null;
-            refreshBtn.Enabled = !busy && shortcuts != null;
-            searchBtn.Enabled = !busy;
+            bool loaded = shortcuts != null;
+            fillBtn.Enabled = !busy && loaded;
+            refreshBtn.Enabled = !busy && loaded;
+            applyBtn.Enabled = !busy && staged.Count > 0;
+            applyBtn.Text = staged.Count > 0
+                ? "Apply " + staged.Count + " change" + (staged.Count > 1 ? "s" : "")
+                : "Apply changes";
+            autoFillBtn.Enabled = !busy && currentShortcut != null;
             backBtn.Enabled = !busy;
             matchCombo.Enabled = !busy;
-            selLabel.Text = sel.Count > 0 ? sel.Count + " change(s) selected" : "";
         }
 
-        // ------------------------------------------------- library (grid) view
+        // ------------------------------------------------- slot state helpers
+
+        string FindExisting(uint appid, string suffix)
+        {
+            if (gridDir == null) return null;
+            foreach (string ext in Cfg.ImageExts)
+            {
+                string p = Path.Combine(gridDir, appid + suffix + ext);
+                if (File.Exists(p)) return p;
+            }
+            return null;
+        }
+
+        bool[] ComputeSlots(uint appid)
+        {
+            var b = new bool[Cfg.Types.Length];
+            for (int i = 0; i < Cfg.Types.Length; i++)
+                b[i] = FindExisting(appid, Cfg.Types[i].Suffix) != null;
+            return b;
+        }
+
+        bool[] GetSlots(uint appid)
+        {
+            bool[] b;
+            if (!slotState.TryGetValue(appid, out b))
+            {
+                b = ComputeSlots(appid);
+                slotState[appid] = b;
+            }
+            return b;
+        }
+
+        int MissingCount(Shortcut g)
+        {
+            if (g.IsSteam) return 0;   // store games always have official art
+            return GetSlots(g.AppId).Count(v => !v);
+        }
+
+        // -------------------------------------------------- library rendering
+
+        void ReloadLibrary()
+        {
+            libGen++;
+            shortcuts = Steam.LoadShortcuts(steamPath, Cfg.Str(cfg, "user_id"), out userId);
+            steamGames = Steam.LoadSteamGames(steamPath);
+            gridDir = Artwork.GridDir(steamPath, userId);
+
+            slotState.Clear();
+            var old = libraryFlow.Controls.Cast<Control>().ToList();
+            libraryFlow.Controls.Clear();
+            foreach (Control c in old) c.Dispose();
+            gameTiles.Clear();
+            foreach (Image img in coverImages.Values) img.Dispose();
+            coverImages.Clear();
+            foreach (Image img in placeholders.Values) img.Dispose();
+            placeholders.Clear();
+
+            foreach (Shortcut sc in AllGames)
+            {
+                GetSlots(sc.AppId);
+                if (sc.IsSteam) QueueSteamCover(sc);
+            }
+            BuildLibrary();
+            RenderScopeSeg();
+            ApplyLibraryFilter();
+
+            // decode custom covers off the UI thread; cards pop in as ready
+            int g = libGen;
+            var snapshot = AllGames.ToList();
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                foreach (Shortcut sc in snapshot)
+                {
+                    if (g != libGen) return;
+                    string p = FindExisting(sc.AppId, "p");
+                    if (p == null) continue;
+                    Bitmap bmp = null;
+                    try
+                    {
+                        using (var src = Image.FromStream(new MemoryStream(File.ReadAllBytes(p))))
+                            bmp = ScaleCover(src);
+                    }
+                    catch (Exception) { continue; }
+                    Shortcut cur = sc;
+                    try
+                    {
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            if (g != libGen) { bmp.Dispose(); return; }
+                            Image prev;
+                            if (coverImages.TryGetValue(cur.AppId, out prev) && prev != null) prev.Dispose();
+                            coverImages[cur.AppId] = bmp;
+                            UpdateTile(cur);
+                        });
+                    }
+                    catch (Exception) { bmp.Dispose(); return; }   // window closed
+                }
+            });
+        }
+
+        void RefreshLibrary()
+        {
+            if (busy) return;
+            try
+            {
+                ReloadLibrary();
+                ShowStrip("Refreshed - " + shortcuts.Count + " shortcuts, " + steamGames.Count +
+                          " Steam games. (Just-added shortcuts may need a Steam restart to appear.)", true);
+            }
+            catch (Exception ex) { ShowStrip("Refresh failed: " + ex.Message, true); }
+        }
+
+        void RenderScopeSeg()
+        {
+            if (shortcuts == null) return;
+            var counts = new int[4];
+            counts[0] = shortcuts.Count + steamGames.Count;
+            counts[1] = shortcuts.Count(g => MissingCount(g) > 0);
+            counts[2] = shortcuts.Count;
+            counts[3] = steamGames.Count;
+            int x = 3;
+            for (int i = 0; i < scopeButtons.Count; i++)
+            {
+                Button b = scopeButtons[i];
+                b.Text = scopeLabels[i] + "   " + counts[i];
+                bool on = (string)b.Tag == scope;
+                b.BackColor = on ? BG3 : BG0;
+                b.ForeColor = on ? TX : DIM;
+                b.Location = new Point(x, 3);
+                x += b.Width + 2;
+            }
+            scopeSeg.Width = x + 3;
+        }
+
+        bool ScopeMatch(Shortcut g)
+        {
+            if (scope == "missing") return !g.IsSteam && MissingCount(g) > 0;
+            if (scope == "nonsteam") return !g.IsSteam;
+            if (scope == "steam") return g.IsSteam;
+            return true;
+        }
+
+        IEnumerable<Shortcut> VisibleGames()
+        {
+            string q = libSearch.Text.Trim();
+            return AllGames.Where(g => ScopeMatch(g) &&
+                (q.Length == 0 || g.Name.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0));
+        }
+
+        void ApplyLibraryFilter()
+        {
+            if (shortcuts == null) return;
+            string q = libSearch.Text.Trim();
+            libraryFlow.SuspendLayout();
+            foreach (Shortcut g in AllGames)
+            {
+                GameCard t;
+                if (gameTiles.TryGetValue(g.AppId, out t))
+                    t.Visible = ScopeMatch(g) &&
+                        (q.Length == 0 || g.Name.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0);
+            }
+            libraryFlow.ResumeLayout();
+        }
+
+        void BuildLibrary()
+        {
+            libraryFlow.SuspendLayout();
+            foreach (Shortcut sc in AllGames)
+            {
+                var card = new GameCard
+                {
+                    Game = sc,
+                    Size = new Size(CoverW + 8, CoverH + 54),
+                    Margin = new Padding(7),
+                    BgNormal = BG0, BgHover = BG2, MeterOn = OKC, MeterOff = METER_OFF
+                };
+                Shortcut captured = sc;
+                card.Click += delegate { if (!busy) OpenDetail(captured); };
+                gameTiles[sc.AppId] = card;
+                libraryFlow.Controls.Add(card);
+                UpdateTile(sc);
+            }
+            libraryFlow.ResumeLayout();
+        }
+
+        void UpdateTile(Shortcut sc)
+        {
+            GameCard t;
+            if (!gameTiles.TryGetValue(sc.AppId, out t)) return;
+            Image cover;
+            if (!coverImages.TryGetValue(sc.AppId, out cover) && sc.IsSteam)
+                steamCoverCache.TryGetValue(sc.AppId, out cover);
+            t.Cover = cover;
+            t.Placeholder = cover == null ? GetPlaceholder(sc) : null;
+            t.Slots = sc.IsSteam ? null : GetSlots(sc.AppId);
+            bool isApplied = applied.Contains(sc.AppId);
+            t.NameColor = isApplied ? OKC : TX;
+            int missing = MissingCount(sc);
+            if (isApplied) { t.StatusText = "updated"; t.StatusColor = OKC; }
+            else if (sc.IsSteam) { t.StatusText = "Steam"; t.StatusColor = DIM; }
+            else if (missing == 4) { t.StatusText = "no artwork"; t.StatusColor = WARN; }
+            else if (missing > 0) { t.StatusText = missing + (missing > 1 ? " slots empty" : " slot empty"); t.StatusColor = WARN; }
+            else { t.StatusText = "complete"; t.StatusColor = DIM; }
+            t.Invalidate();
+        }
+
+        void RefreshGame(uint appid)
+        {
+            slotState[appid] = ComputeSlots(appid);
+            LoadCoverImage(appid);
+            Shortcut sc = AllGames.FirstOrDefault(x => x.AppId == appid);
+            if (sc != null) UpdateTile(sc);
+            RenderScopeSeg();
+        }
+
+        void ShowStrip(string text, bool autoHide)
+        {
+            batchLabel.Text = text;
+            batchTxt.Text = "";
+            batchBarInner.Width = 0;
+            batchStrip.Visible = true;
+            stripHideTimer.Stop();
+            if (autoHide) stripHideTimer.Start();
+        }
+
+        // ----------------------------------------------------- cover images
 
         static Bitmap ScaleCover(Image src)
         {
@@ -1363,8 +1674,29 @@ namespace SteamGridDBFetcher
             catch (Exception) { }
         }
 
-        // Fetch a Steam-store game's own library cover from the CDN in the
-        // background (session-cached), so store games show their real art.
+        Image GetPlaceholder(Shortcut sc)
+        {
+            Image ph;
+            if (placeholders.TryGetValue(sc.AppId, out ph)) return ph;
+            var bmp = new Bitmap(CoverW, CoverH);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                using (var lg = new LinearGradientBrush(
+                    new Rectangle(0, 0, CoverW, CoverH),
+                    ColorTranslator.FromHtml("#2b3446"), ColorTranslator.FromHtml("#151a26"), 65f))
+                    g.FillRectangle(lg, 0, 0, CoverW, CoverH);
+                TextRenderer.DrawText(g, sc.Name, new Font("Segoe UI", 11f, FontStyle.Bold),
+                    new Rectangle(14, 14, CoverW - 28, CoverH - 28),
+                    ColorTranslator.FromHtml("#aeb6c6"),
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
+                    TextFormatFlags.WordBreak);
+            }
+            placeholders[sc.AppId] = bmp;
+            return bmp;
+        }
+
+        // Fetch a Steam-store game's own library cover: local Steam cache
+        // first (exactly what Steam shows, offline), then both CDNs.
         void QueueSteamCover(Shortcut sc)
         {
             if (steamCoverCache.ContainsKey(sc.AppId)) return;
@@ -1376,23 +1708,12 @@ namespace SteamGridDBFetcher
                 try
                 {
                     byte[] data = null;
-
-                    // Steam's local library cache first: it's exactly the art
-                    // Steam itself shows, works offline, and covers titles the
-                    // public CDNs are missing.
                     string cache = Path.Combine(steamPath, "appcache", "librarycache");
                     var local = new List<string>
                     {
                         Path.Combine(cache, appid + "_library_600x900.jpg"),
                         Path.Combine(cache, appid.ToString(), "library_600x900.jpg"),
                     };
-                    try
-                    {
-                        string sub = Path.Combine(cache, appid.ToString());
-                        if (Directory.Exists(sub))
-                            local.AddRange(Directory.GetFiles(sub, "library_600x900*"));
-                    }
-                    catch (Exception) { }
                     foreach (string lc in local)
                         if (File.Exists(lc))
                         {
@@ -1400,10 +1721,7 @@ namespace SteamGridDBFetcher
                             catch (Exception) { }
                         }
 
-                    // Newer Steam cache layout: librarycache/{appid}/{hash}/
-                    // subfolders, each holding a properly named image. Search
-                    // recursively; some titles (demos) only have the store
-                    // capsule instead of a library capsule.
+                    // hash-subfolder layout: {appid}/{hash}/library_600x900.jpg
                     if (data == null)
                     {
                         try
@@ -1452,7 +1770,7 @@ namespace SteamGridDBFetcher
                         if (steamCoverCache.ContainsKey(appid)) { bmp.Dispose(); return; }
                         steamCoverCache[appid] = bmp;
                         if (g != libGen) return;
-                        Shortcut cur = DisplayGames.FirstOrDefault(x => x.AppId == appid);
+                        Shortcut cur = AllGames.FirstOrDefault(x => x.AppId == appid);
                         if (cur != null) UpdateTile(cur);
                     });
                 }
@@ -1460,210 +1778,223 @@ namespace SteamGridDBFetcher
             });
         }
 
-        Image GetPlaceholder(Shortcut sc)
+        // ------------------------------------------------------ batch fill
+
+        // Fill ONLY missing asset slots for the games currently visible in the
+        // library. Official Steam defaults first, SteamGridDB top results as
+        // fallback; existing artwork is never replaced.
+        async void FillMissing()
         {
-            Image ph;
-            if (placeholders.TryGetValue(sc.AppId, out ph)) return ph;
-            var bmp = new Bitmap(CoverW, CoverH);
-            using (var g = Graphics.FromImage(bmp))
+            if (busy || api == null || shortcuts == null) return;
+            var targets = VisibleGames().Where(x => MissingCount(x) > 0).ToList();
+            if (targets.Count == 0)
             {
-                using (var lg = new LinearGradientBrush(
-                    new Rectangle(0, 0, CoverW, CoverH),
-                    ColorTranslator.FromHtml("#3E4E6B"), ColorTranslator.FromHtml("#1B2434"), 65f))
-                    g.FillRectangle(lg, 0, 0, CoverW, CoverH);
-                TextRenderer.DrawText(g, sc.Name, new Font("Segoe UI", 10f),
-                    new Rectangle(10, 10, CoverW - 20, CoverH - 20),
-                    ColorTranslator.FromHtml("#c7d0da"),
-                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
-                    TextFormatFlags.WordBreak);
+                ShowStrip("Nothing to fill - every game in the current view has complete artwork.", true);
+                return;
             }
-            placeholders[sc.AppId] = bmp;
-            return bmp;
-        }
+            DialogResult r = MessageBox.Show(this,
+                targets.Count + " of the games currently shown have empty slots.\n\n" +
+                "Empty slots get the official Steam default art (SteamGridDB top result if the " +
+                "game isn't on Steam). Artwork you already have is never touched; games hidden " +
+                "by the search box or scope are not touched either.",
+                "Fill missing artwork", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (r != DialogResult.Yes) return;
 
-        // Re-reads shortcuts.vdf (and installed Steam games when enabled)
-        // from disk and rebuilds the whole grid.
-        void ReloadLibrary()
-        {
-            libGen++;
-            shortcuts = Steam.LoadShortcuts(steamPath, Cfg.Str(cfg, "user_id"), out userId);
-            steamGames = steamBox.Checked ? Steam.LoadSteamGames(steamPath) : new List<Shortcut>();
-            gridDir = Artwork.GridDir(steamPath, userId);
-
-            var old = libraryFlow.Controls.Cast<Control>().ToList();
-            libraryFlow.Controls.Clear();
-            foreach (Control c in old) c.Dispose();
-            gameTiles.Clear();
-            foreach (Image img in coverImages.Values) img.Dispose();
-            coverImages.Clear();
-            foreach (Image img in placeholders.Values) img.Dispose();
-            placeholders.Clear();
-
-            foreach (Shortcut sc in DisplayGames)
-            {
-                LoadCoverImage(sc.AppId);
-                if (sc.IsSteam && !coverImages.ContainsKey(sc.AppId))
-                    QueueSteamCover(sc);   // show Steam's own cover for store games
-            }
-            BuildLibrary();
-            UpdateProfileLabel();
-            ApplyFilter();
-        }
-
-        void RefreshLibrary()
-        {
-            if (busy) return;
+            busy = true;
+            UpdateButtons();
+            batchStrip.Visible = true;
+            stripHideTimer.Stop();
+            int updated = 0, none = 0;
             try
             {
-                ReloadLibrary();
-                SetStatus("Refreshed - " + shortcuts.Count + " games. (If a just-added " +
-                          "shortcut is missing, restart Steam: it can hold shortcuts.vdf " +
-                          "in memory until it exits.)", OKC);
-            }
-            catch (Exception ex) { SetStatus("Refresh failed: " + ex.Message, ERRC); }
-        }
+                for (int i = 0; i < targets.Count; i++)
+                {
+                    Shortcut sc = targets[i];
+                    batchLabel.Text = "Filling " + sc.Name + "...";
+                    batchTxt.Text = (i + 1) + " / " + targets.Count;
+                    batchBarInner.Width = (int)((long)batchBarOuter.Width * (i + 1) / targets.Count);
 
-        void ApplyFilter()
-        {
-            if (shortcuts == null || filterBox == null) return;
-            string f = filterBox.Text.Trim();
-            foreach (Shortcut sc in DisplayGames)
-            {
-                GameTile t;
-                if (gameTiles.TryGetValue(sc.AppId, out t))
-                    t.Root.Visible = f.Length == 0 ||
-                        sc.Name.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0;
-            }
-        }
+                    var missing = Cfg.Types.Where(t => FindExisting(sc.AppId, t.Suffix) == null).ToList();
+                    bool wrote = false;
 
-        void BuildLibrary()
-        {
-            libraryFlow.SuspendLayout();
-            foreach (Shortcut sc in DisplayGames)
-            {
-                var tile = new GameTile();
-                tile.Root = new Panel
-                {
-                    Size = new Size(CoverW + 8, CoverH + 48), BackColor = PANEL,
-                    Margin = new Padding(8), Cursor = Cursors.Hand
-                };
-                tile.Pic = new PictureBox
-                {
-                    Location = new Point(4, 4), Size = new Size(CoverW, CoverH),
-                    SizeMode = PictureBoxSizeMode.StretchImage, BackColor = PANEL,
-                    Cursor = Cursors.Hand
-                };
-                tile.Name = new Label
-                {
-                    Location = new Point(4, CoverH + 10), Size = new Size(CoverW, 17),
-                    ForeColor = TX, BackColor = PANEL, AutoEllipsis = true, Text = sc.Name,
-                    Cursor = Cursors.Hand
-                };
-                tile.Status = new Label
-                {
-                    Location = new Point(4, CoverH + 28), Size = new Size(CoverW, 16),
-                    ForeColor = DIM, BackColor = PANEL, Font = new Font("Segoe UI", 8.25f),
-                    Cursor = Cursors.Hand
-                };
-                tile.Root.Controls.Add(tile.Pic);
-                tile.Root.Controls.Add(tile.Name);
-                tile.Root.Controls.Add(tile.Status);
+                    List<SgdbGame> res = null;
+                    try { res = (await api.SearchSmart(sc.Name)).Value; }
+                    catch (Exception) { }
+                    if (res != null && res.Count > 0)
+                    {
+                        int steamId = await api.SteamAppId(res[0].Id);
+                        if (steamId > 0)
+                        {
+                            foreach (AType t in missing.ToList())
+                            {
+                                if (await SteamStore.Apply(gridDir, sc.AppId, t, steamId, stamp) != null)
+                                {
+                                    missing.Remove(t);
+                                    wrote = true;
+                                }
+                            }
+                        }
+                        foreach (AType t in missing)
+                        {
+                            try
+                            {
+                                var assets = t.Key == "logo"
+                                    ? await api.OfficialLogos(res[0].Id)
+                                    : new List<SgdbAsset>();
+                                if (assets.Count == 0)
+                                    assets = await api.Assets(res[0].Id, t);
+                                if (assets.Count > 0)
+                                {
+                                    await Artwork.Apply(gridDir, sc.AppId, t, assets[0].Url, stamp);
+                                    wrote = true;
+                                }
+                            }
+                            catch (Exception) { }
+                            await Task.Delay(100);   // be polite to the API/CDN
+                        }
+                    }
 
-                Shortcut captured = sc;
-                EventHandler click = delegate { if (!busy) OpenPicker(captured); };
-                tile.Root.Click += click; tile.Pic.Click += click;
-                tile.Name.Click += click; tile.Status.Click += click;
-
-                GameTile t = tile;
-                EventHandler enter = delegate { t.Root.BackColor = PANEL2; t.Name.BackColor = PANEL2; t.Status.BackColor = PANEL2; };
-                EventHandler leave = delegate { t.Root.BackColor = PANEL; t.Name.BackColor = PANEL; t.Status.BackColor = PANEL; };
-                foreach (Control c in new Control[] { tile.Root, tile.Pic, tile.Name, tile.Status })
-                {
-                    c.MouseEnter += enter;
-                    c.MouseLeave += leave;
+                    if (wrote) { updated++; applied.Add(sc.AppId); }
+                    else none++;
+                    RefreshGame(sc.AppId);
                 }
-
-                gameTiles[sc.AppId] = tile;
-                libraryFlow.Controls.Add(tile.Root);
-                UpdateTile(sc);
+                batchLabel.Text = "Done: " + updated + " filled in, " + none +
+                                  " with nothing found. Press F5 in your Steam library to see the artwork.";
+                batchTxt.Text = "";
+                batchBarInner.Width = batchBarOuter.Width;
+                stripHideTimer.Start();
+                ApplyLibraryFilter();   // the "missing" scope may have shrunk
             }
-            libraryFlow.ResumeLayout();
+            finally { busy = false; UpdateButtons(); }
         }
 
-        void UpdateTile(Shortcut sc)
-        {
-            GameTile t;
-            if (!gameTiles.TryGetValue(sc.AppId, out t)) return;
-            Image cover;
-            if (!coverImages.TryGetValue(sc.AppId, out cover) && sc.IsSteam)
-                steamCoverCache.TryGetValue(sc.AppId, out cover);
-            t.Pic.Image = cover != null ? cover : GetPlaceholder(sc);
-            bool isApplied = applied.Contains(sc.AppId);
-            t.Name.ForeColor = isApplied ? OKC : TX;
-            if (isApplied) { t.Status.Text = "updated"; t.Status.ForeColor = OKC; }
-            else if (sc.IsSteam) { t.Status.Text = "Steam"; t.Status.ForeColor = DIM; }
-            else if (cover == null) { t.Status.Text = "missing artwork"; t.Status.ForeColor = WARN; }
-            else { t.Status.Text = ""; }
-        }
+        // ------------------------------------------------- detail: open/back
 
-        void UpdateProfileLabel()
-        {
-            if (shortcuts == null) return;
-            int missing = shortcuts.Count(sc => !coverImages.ContainsKey(sc.AppId));
-            profileLabel.Text = "Profile " + userId + "   -   " + shortcuts.Count + " non-Steam games"
-                + (steamGames.Count > 0 ? " + " + steamGames.Count + " Steam games" : "")
-                + (missing > 0 ? "   -   " + missing + " without cover art" : "   -   all covered");
-        }
-
-        void RefreshGame(uint appid)
-        {
-            LoadCoverImage(appid);
-            Shortcut sc = DisplayGames.FirstOrDefault(x => x.AppId == appid);
-            if (sc != null) UpdateTile(sc);
-            UpdateProfileLabel();
-        }
-
-        // ------------------------------------------------- view switching
-
-        void OpenPicker(Shortcut sc)
+        void OpenDetail(Shortcut sc)
         {
             currentShortcut = sc;
-            gameTitle.Text = sc.Name;
+            staged.Clear();
+            lastUndo = null;
+            undoLink.Visible = false;
+            dName.Text = sc.Name;
+            dSearch.Text = sc.Name;
+            SetRailStatus("", false);
             libraryView.Visible = false;
-            pickerView.Visible = true;
-            // layout is deferred while the view is hidden; without this the
-            // auto-sized header keeps a stale height and the content docks
-            // below it, leaving a dead gap until the next layout event
-            pickerHeader.PerformLayout();
-            pickerView.PerformLayout();
-            searchBox.Text = sc.Name;
+            detailView.Visible = true;
+            UpdateRail();
             DoSearch();
         }
 
         void BackToLibrary()
         {
             if (busy) return;
-            gen++;   // cancel any in-flight loads
+            gen++;
             currentSgdbId = -1;
-            sel.Clear();
+            currentShortcut = null;
+            staged.Clear();
             ClearSections();
-            pickerView.Visible = false;
+            detailView.Visible = false;
             libraryView.Visible = true;
             UpdateButtons();
-            SetStatus("Ready. Click a game to pick its artwork.", DIM);
         }
 
-        // -------------------------------------------- existing-artwork helpers
-
-        string FindExisting(uint appid, string suffix)
+        void SetRailStatus(string text, bool ok)
         {
-            if (gridDir == null) return null;
-            foreach (string ext in Cfg.ImageExts)
+            railStatus.Text = text;
+            railStatus.ForeColor = ok ? OKC : DIM;
+        }
+
+        void SetRailError(string text)
+        {
+            railStatus.Text = text;
+            railStatus.ForeColor = ERRC;
+        }
+
+        // ------------------------------------------------- detail: rail state
+
+        void UpdateRail()
+        {
+            if (currentShortcut == null) return;
+            bool[] slots = GetSlots(currentShortcut.AppId);
+
+            UpdateHero();
+
+            for (int i = 0; i < Cfg.Types.Length; i++)
             {
-                string p = Path.Combine(gridDir, appid + suffix + ext);
-                if (File.Exists(p)) return p;
+                AType t = Cfg.Types[i];
+                bool isStaged = staged.ContainsKey(t.Key);
+                Color c = isStaged ? ACC : slots[i] ? OKC : currentShortcut.IsSteam ? DIM : WARN;
+                string txt = isStaged ? "will change"
+                    : slots[i] ? "set"
+                    : currentShortcut.IsSteam ? "Steam default" : "empty";
+                chkDot[t.Key].ForeColor = c;
+                chkStatus[t.Key].ForeColor = c;
+                chkStatus[t.Key].Text = txt;
             }
-            return null;
+
+            if (staged.Count == 0)
+            {
+                stagedLabel.Text = "Nothing staged - pick assets on the right.";
+                stagedLabel.ForeColor = DIM;
+            }
+            else
+            {
+                var sb = new StringBuilder();
+                foreach (AType t in Cfg.Types)
+                {
+                    Pick pk;
+                    if (staged.TryGetValue(t.Key, out pk))
+                        sb.AppendLine(t.Short + "  →  " + pk.SourceLabel);
+                }
+                stagedLabel.Text = sb.ToString().TrimEnd();
+                stagedLabel.ForeColor = TX;
+            }
+            UpdateButtons();
+        }
+
+        void UpdateHero()
+        {
+            if (currentShortcut == null) return;
+            Pick pk;
+            if (staged.TryGetValue("cover", out pk) && pk.Tile != null && !pk.Tile.IsDisposed
+                && pk.Tile.Controls.Count > 0)
+            {
+                var tpb = pk.Tile.Controls[0] as PictureBox;
+                if (tpb != null && tpb.Image != null)
+                {
+                    heroPb.Image = tpb.Image;
+                    return;
+                }
+            }
+            string p = FindExisting(currentShortcut.AppId, "p");
+            Image img = null;
+            if (p != null)
+            {
+                try { img = Image.FromStream(new MemoryStream(File.ReadAllBytes(p))); }
+                catch (Exception) { }
+            }
+            if (img == null && currentShortcut.IsSteam)
+            {
+                Image sc;
+                if (steamCoverCache.TryGetValue(currentShortcut.AppId, out sc))
+                {
+                    heroPb.Image = sc;
+                    if (heroOwned != null) { heroOwned.Dispose(); heroOwned = null; }
+                    return;
+                }
+            }
+            if (img != null)
+            {
+                Image prev = heroOwned;
+                heroOwned = img;
+                heroPb.Image = img;
+                if (prev != null) prev.Dispose();
+            }
+            else
+            {
+                heroPb.Image = GetPlaceholder(currentShortcut);
+                if (heroOwned != null) { heroOwned.Dispose(); heroOwned = null; }
+            }
         }
 
         // ------------------------------------------------------ picker: search
@@ -1671,7 +2002,7 @@ namespace SteamGridDBFetcher
         void ClearSections()
         {
             flows.Clear(); countLabels.Clear(); tiles.Clear(); tileAssets.Clear();
-            selBadges.Clear();   // badges are children of the disposed tiles
+            currentTiles.Clear(); officialTiles.Clear();
             var old = sectionsFlow.Controls.Cast<Control>().ToList();
             sectionsFlow.Controls.Clear();
             foreach (Control c in old) c.Dispose();
@@ -1682,22 +2013,22 @@ namespace SteamGridDBFetcher
             ClearSections();
             sectionsFlow.Controls.Add(new Label
             {
-                Text = text, ForeColor = DIM, BackColor = BG, AutoSize = true,
+                Text = text, ForeColor = DIM, BackColor = BG0, AutoSize = true,
                 Margin = new Padding(6, 30, 0, 0), Font = new Font("Segoe UI", 10f)
             });
         }
 
         async void DoSearch()
         {
-            string term = searchBox.Text.Trim();
-            if (term.Length == 0 || busy || api == null) return;
+            string term = dSearch.Text.Trim();
+            if (term.Length == 0 || busy || api == null || currentShortcut == null) return;
             gen++;
             int g = gen;
-            sel.Clear();
+            staged.Clear();
             currentSgdbId = -1;
-            UpdateButtons();
+            UpdateRail();
             ShowPlaceholder("Searching SteamGridDB...");
-            SetStatus("Searching \"" + term + "\"...", DIM);
+            SetRailStatus("Searching \"" + term + "\"...", false);
             List<SgdbGame> results;
             string usedTerm;
             try
@@ -1706,14 +2037,11 @@ namespace SteamGridDBFetcher
                 usedTerm = smart.Key;
                 results = smart.Value;
             }
-            catch (Exception ex) { SetStatus("Search failed: " + ex.Message, ERRC); return; }
+            catch (Exception ex) { SetRailError("Search failed: " + ex.Message); return; }
             if (g != gen) return;
 
             if (results.Count > 0 && usedTerm != term)
-            {
-                searchBox.Text = usedTerm;   // show the term that actually matched
-                term = usedTerm;
-            }
+                dSearch.Text = usedTerm;   // show the term that actually matched
 
             matches.Clear();
             matches.AddRange(results);
@@ -1725,13 +2053,13 @@ namespace SteamGridDBFetcher
             if (matches.Count == 0)
             {
                 ShowPlaceholder("No SteamGridDB match. Try a different search term.");
-                SetStatus("No results for \"" + term + "\".", ERRC);
+                SetRailError("No results for \"" + term + "\".");
                 return;
             }
             suppressMatch = true;
             matchCombo.SelectedIndex = 0;
             suppressMatch = false;
-            SetStatus(matches.Count + " match(es).", OKC);
+            SetRailStatus(matches.Count + " match(es).", true);
             LoadAssets(matches[0].Id, matches[0].Name);
         }
 
@@ -1740,24 +2068,23 @@ namespace SteamGridDBFetcher
             gen++;
             int g = gen;
             currentSgdbId = gameId;
-            sel.Clear();
-            UpdateButtons();
+            staged.Clear();
+            UpdateRail();
 
             Shortcut game = currentShortcut;
-            var hasExisting = new Dictionary<string, bool>();
             ClearSections();
             foreach (AType t in Cfg.Types)
             {
                 sectionsFlow.Controls.Add(new Label
                 {
-                    Text = t.Label, ForeColor = TX, BackColor = BG, AutoSize = true,
+                    Text = t.Label, ForeColor = TX, BackColor = BG0, AutoSize = true,
                     Font = new Font("Segoe UI", 11f, FontStyle.Bold),
                     Margin = new Padding(4, 16, 0, 0)
                 });
                 var cnt = new Label
                 {
-                    Text = "loading...", ForeColor = DIM, BackColor = BG, AutoSize = true,
-                    Font = new Font("Segoe UI", 8.25f), Margin = new Padding(5, 2, 0, 2)
+                    Text = "loading...", ForeColor = DIM, BackColor = BG0, AutoSize = true,
+                    Font = new Font("Segoe UI", 8f), Margin = new Padding(5, 2, 0, 2)
                 };
                 countLabels[t.Key] = cnt;
                 sectionsFlow.Controls.Add(cnt);
@@ -1766,19 +2093,24 @@ namespace SteamGridDBFetcher
                 {
                     FlowDirection = FlowDirection.LeftToRight, WrapContents = true,
                     AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                    BackColor = BG, Margin = new Padding(0)
+                    BackColor = BG0, Margin = new Padding(0)
                 };
                 flows[t.Key] = flow;
                 tiles[t.Key] = new List<Panel>();
                 sectionsFlow.Controls.Add(flow);
                 string existing = game != null ? FindExisting(game.AppId, t.Suffix) : null;
-                hasExisting[t.Key] = existing != null;
-                AddCurrentTile(t, flow, existing);
+                AddCurrentTile(t, flow, existing, game);
             }
             UpdateFlowWidths();
-            SetStatus("Loading assets for " + gameName + "...", DIM);
+            RefreshAllHighlights();
+            SetRailStatus("Loading assets for " + gameName + "...", false);
 
-            // offer the game's original Steam assets as picks, like auto mode uses
+            // fire every request up front so the network round-trips overlap
+            var pageTasks = new Dictionary<string, Task<AssetPage>>();
+            foreach (AType t in Cfg.Types)
+                pageTasks[t.Key] = api.AssetsPaged(gameId, t, 0);
+
+            // offer the game's original Steam assets as picks
             int steamId = 0;
             try { steamId = await api.SteamAppId(gameId); }
             catch (Exception) { }
@@ -1793,7 +2125,7 @@ namespace SteamGridDBFetcher
             foreach (AType t in Cfg.Types)
             {
                 AssetPage pg;
-                try { pg = await api.AssetsPaged(gameId, t, 0); }
+                try { pg = await pageTasks[t.Key]; }
                 catch (Exception ex)
                 {
                     if (g == gen) countLabels[t.Key].Text = "failed to load (" + ex.Message + ")";
@@ -1806,62 +2138,65 @@ namespace SteamGridDBFetcher
                 shownByType[t.Key] = pg.Assets.Count;
                 countLabels[t.Key].Text = pg.Total == 0
                     ? "none available on SteamGridDB"
-                    : pg.Total + " available - click to pick";
+                    : pg.Total + " available - click to stage a change";
 
-                bool preselected = false;
                 for (int i = 0; i < pg.Assets.Count; i++)
                 {
                     Panel tile = AddAssetTile(t, flows[t.Key], pg.Assets[i]);
-                    // default pick: keep existing art if there is any, else the
-                    // top result that passes the current filters
-                    if (!preselected && !hasExisting[t.Key] && ShouldShow(pg.Assets[i]))
-                    {
-                        SelectTile(t.Key, tile, pg.Assets[i].Url);
-                        preselected = true;
-                    }
-                    // by type, not index: the selection badge sits at index 0
-                    LoadThumb(tile.Controls.OfType<PictureBox>().First(), pg.Assets[i], g);
+                    LoadThumb((PictureBox)tile.Controls[0], pg.Assets[i], g);
                 }
                 if (shownByType[t.Key] < pg.Total)
                     AddLoadMoreTile(t, g);
             }
             if (g == gen)
-                SetStatus("Assets loaded. Click thumbnails to change picks, then Apply selected.", OKC);
+                SetRailStatus("Assets loaded. Click tiles to stage changes, then Apply.", true);
         }
 
+        // ------------------------------------------------------- picker tiles
+
         // First tile of every row: what the game has right now. Clicking it
-        // means "keep as is". Shows the existing image, or "none" if missing.
-        void AddCurrentTile(AType t, FlowLayoutPanel flow, string existingPath)
+        // means "keep as is" (unstage). For Steam-store games without custom
+        // art, "current" is the game's official Steam default - show it.
+        void AddCurrentTile(AType t, FlowLayoutPanel flow, string existingPath, Shortcut game)
         {
+            bool steamDefault = existingPath == null && game != null && game.IsSteam;
             var p = new Panel
             {
-                Size = new Size(t.W + 10, t.H + 10), BackColor = PANEL,
+                Size = new Size(t.W + 10, t.H + 10), BackColor = BG2,
                 Margin = new Padding(4), Tag = null
             };
             var caption = new Label
             {
-                Text = existingPath != null ? "current" : "none",
-                ForeColor = existingPath != null ? DIM : WARN,
-                BackColor = FIELD, Font = new Font("Segoe UI", 8.25f),
-                Location = new Point(5, 5 + t.H - 18), Size = new Size(t.W, 18),
+                Text = existingPath != null ? "current"
+                     : steamDefault ? "current · Steam default" : "none",
+                ForeColor = existingPath != null || steamDefault ? ACC : WARN,
+                BackColor = FIELD, Font = new Font("Segoe UI", 7.5f),
+                Location = new Point(5, 5 + t.H - 16), Size = new Size(t.W, 16),
                 TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand
             };
             string key = t.Key;
-            EventHandler h = delegate { SelectTile(key, p, null); };
+            EventHandler h = delegate { Unstage(key); };
 
-            if (existingPath != null)
+            if (existingPath != null || steamDefault)
             {
                 var pb = new PictureBox
                 {
-                    Location = new Point(5, 5), Size = new Size(t.W, t.H - 18),
+                    Location = new Point(5, 5), Size = new Size(t.W, t.H - 16),
                     SizeMode = PictureBoxSizeMode.Zoom, BackColor = FIELD, Cursor = Cursors.Hand
                 };
-                try
+                if (existingPath != null)
                 {
-                    byte[] bytes = File.ReadAllBytes(existingPath);
-                    pb.Image = Image.FromStream(new MemoryStream(bytes));
+                    try
+                    {
+                        byte[] bytes = File.ReadAllBytes(existingPath);
+                        pb.Image = Image.FromStream(new MemoryStream(bytes));
+                    }
+                    catch (Exception) { }
                 }
-                catch (Exception) { }
+                else
+                {
+                    LoadSteamDefaultInto(pb, game.AppId, t.Key);
+                }
                 p.Controls.Add(pb);
                 pb.Click += h;
             }
@@ -1870,9 +2205,9 @@ namespace SteamGridDBFetcher
                 var empty = new Label
                 {
                     Text = "keep\nempty", ForeColor = DIM, BackColor = FIELD,
-                    Location = new Point(5, 5), Size = new Size(t.W, t.H - 18),
+                    Location = new Point(5, 5), Size = new Size(t.W, t.H - 16),
                     TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand,
-                    Font = new Font("Segoe UI", 8.25f)
+                    Font = new Font("Segoe UI", 8f)
                 };
                 p.Controls.Add(empty);
                 empty.Click += h;
@@ -1882,8 +2217,63 @@ namespace SteamGridDBFetcher
             p.Click += h;
             flow.Controls.Add(p);
             tiles[key].Add(p);
-            // keeping what's there is the default until the user picks something
-            SelectTile(key, p, null);
+            currentTiles[key] = p;
+        }
+
+        // What Steam's local cache / CDN calls each default asset.
+        static readonly Dictionary<string, string> CacheFlat = new Dictionary<string, string>
+        {
+            { "cover", "_library_600x900.jpg" }, { "wide", "_header.jpg" },
+            { "background", "_library_hero.jpg" }, { "logo", "_logo.png" },
+        };
+        static readonly Dictionary<string, string[]> CachePatterns = new Dictionary<string, string[]>
+        {
+            { "cover",      new string[] { "library_600x900*", "library_capsule.*", "capsule*" } },
+            { "wide",       new string[] { "library_header.*", "header.*" } },
+            { "background", new string[] { "library_hero.*" } },
+            { "logo",       new string[] { "logo.*" } },
+        };
+
+        // The official default asset a Steam-store game is currently showing:
+        // Steam's local librarycache first (both layouts), then the CDNs.
+        byte[] SteamDefaultBytes(uint appid, string typeKey)
+        {
+            try
+            {
+                string cache = Path.Combine(steamPath, "appcache", "librarycache");
+                string flat = Path.Combine(cache, appid + CacheFlat[typeKey]);
+                if (File.Exists(flat)) return File.ReadAllBytes(flat);
+                string sub = Path.Combine(cache, appid.ToString());
+                if (Directory.Exists(sub))
+                    foreach (string pattern in CachePatterns[typeKey])
+                    {
+                        string[] found = Directory.GetFiles(sub, pattern, SearchOption.AllDirectories);
+                        if (found.Length > 0) return File.ReadAllBytes(found[0]);
+                    }
+            }
+            catch (Exception) { }
+            foreach (string u in SteamStore.PreviewUrls((int)appid, typeKey))
+            {
+                try
+                {
+                    using (var wc = new WebClient())
+                    {
+                        wc.Headers["User-Agent"] = "SteamGridDBFetcher/1.0";
+                        return wc.DownloadData(u);
+                    }
+                }
+                catch (Exception) { }
+            }
+            return null;
+        }
+
+        async void LoadSteamDefaultInto(PictureBox pb, uint appid, string typeKey)
+        {
+            int g = gen;
+            byte[] data = await Task.Run(() => SteamDefaultBytes(appid, typeKey));
+            if (data == null || g != gen || pb.IsDisposed) return;
+            try { pb.Image = Image.FromStream(new MemoryStream(data)); }
+            catch (Exception) { }
         }
 
         // The game's original Steam asset, selectable like any other pick.
@@ -1905,57 +2295,67 @@ namespace SteamGridDBFetcher
             string selUrl = "official:" + steamId;
             var p = new Panel
             {
-                Size = new Size(t.W + 10, t.H + 10), BackColor = PANEL,
+                Size = new Size(t.W + 10, t.H + 10), BackColor = BG2,
                 Margin = new Padding(4), Tag = selUrl
             };
             var pb = new PictureBox
             {
-                Location = new Point(5, 5), Size = new Size(t.W, t.H - 18),
+                Location = new Point(5, 5), Size = new Size(t.W, t.H - 16),
                 SizeMode = PictureBoxSizeMode.Zoom, BackColor = FIELD,
                 Cursor = Cursors.Hand, Image = img
             };
             var caption = new Label
             {
                 Text = "Steam default", ForeColor = OKC, BackColor = FIELD,
-                Font = new Font("Segoe UI", 8.25f),
-                Location = new Point(5, 5 + t.H - 18), Size = new Size(t.W, 18),
+                Font = new Font("Segoe UI", 7.5f),
+                Location = new Point(5, 5 + t.H - 16), Size = new Size(t.W, 16),
                 TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand
             };
             p.Controls.Add(pb);
             p.Controls.Add(caption);
             string key = t.Key;
-            EventHandler h = delegate { SelectTile(key, p, selUrl); };
+            EventHandler h = delegate { Stage(key, selUrl, "Steam default", p); };
             p.Click += h; pb.Click += h; caption.Click += h;
             flow.Controls.Add(p);
             flow.Controls.SetChildIndex(p, 1);   // right after the "current" tile
             tiles[key].Add(p);
+            officialTiles[key] = p;
+            UpdateHighlights(key);
         }
 
         Panel AddAssetTile(AType t, FlowLayoutPanel flow, SgdbAsset a)
         {
             string url = a.Url;
-            bool animated = a.Animated;
+            var capBits = new List<string>();
+            if (a.Animated) capBits.Add("animated");
+            if (a.Nsfw) capBits.Add("adult");
+            if (a.Humor) capBits.Add("humor");
+            if (a.Epilepsy) capBits.Add("epilepsy");
+            bool hasCap = capBits.Count > 0;
+
             var p = new Panel
             {
-                Size = new Size(t.W + 10, t.H + 10), BackColor = PANEL,
+                // adult-tagged assets get a red border, like on the SGDB site
+                Size = new Size(t.W + 10, t.H + 10), BackColor = a.Nsfw ? NSFWB : BG2,
                 Margin = new Padding(4), Tag = url
             };
             var pb = new PictureBox
             {
-                Location = new Point(5, 5), Size = new Size(t.W, animated ? t.H - 18 : t.H),
+                Location = new Point(5, 5), Size = new Size(t.W, hasCap ? t.H - 16 : t.H),
                 SizeMode = PictureBoxSizeMode.Zoom, BackColor = FIELD, Cursor = Cursors.Hand
             };
             p.Controls.Add(pb);
             string key = t.Key;
-            EventHandler h = delegate { SelectTile(key, p, url); };
+            string label = a.Animated ? "community · animated" : "community";
+            EventHandler h = delegate { Stage(key, url, label, p); };
             p.Click += h; pb.Click += h;
-            if (animated)
+            if (hasCap)
             {
                 var cap = new Label
                 {
-                    Text = "animated", ForeColor = DIM, BackColor = FIELD,
-                    Font = new Font("Segoe UI", 8.25f),
-                    Location = new Point(5, 5 + t.H - 18), Size = new Size(t.W, 18),
+                    Text = string.Join(" · ", capBits), ForeColor = a.Animated ? ACC : WARN,
+                    BackColor = FIELD, Font = new Font("Segoe UI", 7.5f),
+                    Location = new Point(5, 5 + t.H - 16), Size = new Size(t.W, 16),
                     TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand
                 };
                 p.Controls.Add(cap);
@@ -1974,12 +2374,12 @@ namespace SteamGridDBFetcher
             int remaining = totalByType[t.Key] - shownByType[t.Key];
             var p = new Panel
             {
-                Size = new Size(t.W + 10, t.H + 10), BackColor = PANEL2,
+                Size = new Size(t.W + 10, t.H + 10), BackColor = BG3,
                 Margin = new Padding(4), Cursor = Cursors.Hand
             };
             var lbl = new Label
             {
-                Text = "Load more\n(" + remaining + " left)", ForeColor = TX, BackColor = PANEL2,
+                Text = "Load more\n(" + remaining + " left)", ForeColor = ACC, BackColor = BG3,
                 Location = new Point(5, 5), Size = new Size(t.W, t.H),
                 TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand,
                 Font = new Font("Segoe UI", 9f, FontStyle.Bold)
@@ -2005,7 +2405,7 @@ namespace SteamGridDBFetcher
             foreach (SgdbAsset a in pg.Assets)
             {
                 Panel tp = AddAssetTile(t, flow, a);
-                LoadThumb(tp.Controls.OfType<PictureBox>().First(), a, g);
+                LoadThumb((PictureBox)tp.Controls[0], a, g);
             }
             shownByType[t.Key] += pg.Assets.Count;
             if (pg.Assets.Count > 0 && shownByType[t.Key] < totalByType[t.Key])
@@ -2080,13 +2480,7 @@ namespace SteamGridDBFetcher
                     if (scale < 1.0)
                         src = new System.Windows.Media.Imaging.TransformedBitmap(
                             frame, new System.Windows.Media.ScaleTransform(scale, scale));
-                    var enc = new System.Windows.Media.Imaging.PngBitmapEncoder();
-                    enc.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(src));
-                    using (var ms = new MemoryStream())
-                    {
-                        enc.Save(ms);
-                        clip.Frames.Add(Image.FromStream(new MemoryStream(ms.ToArray())));
-                    }
+                    clip.Frames.Add(WpfToBitmap(src));
                     int delay = 70;
                     try
                     {
@@ -2142,18 +2536,50 @@ namespace SteamGridDBFetcher
                         });
                     else
                         clip.Frames.Clear();   // single frame: keep image, drop clip
+                    MaybeUpdateHero(pb);
                     return;
                 }
-                // fall through: static single-frame fallback below
             }
-            try { pb.Image = Image.FromStream(new MemoryStream(data)); }
-            catch (Exception)
+            // decode off the UI thread so tiles never jank the window
+            Image img = await Task.Run(delegate
             {
-                // GDI+ can't decode WebP; try WIC for a single frame,
-                // else show a labeled placeholder.
-                Image wic = WicDecode(data);
-                pb.Image = wic != null ? wic : TextThumb(pb.Width, pb.Height);
+                try { return (Image)new Bitmap(new MemoryStream(data)); }
+                catch (Exception) { return WicDecode(data); }
+            });
+            if (g != gen || pb.IsDisposed)
+            {
+                if (img != null) img.Dispose();
+                return;
             }
+            pb.Image = img != null ? img : TextThumb(pb.Width, pb.Height);
+            MaybeUpdateHero(pb);
+        }
+
+        void MaybeUpdateHero(PictureBox pb)
+        {
+            Pick pk;
+            if (staged.TryGetValue("cover", out pk) && pk.Tile != null && !pk.Tile.IsDisposed
+                && pk.Tile.Controls.Count > 0 && ReferenceEquals(pk.Tile.Controls[0], pb))
+                UpdateHero();
+        }
+
+        // Direct pixel copy from a WPF bitmap into a GDI+ bitmap - far cheaper
+        // than the PNG encode/decode round trip per animation frame.
+        static Bitmap WpfToBitmap(System.Windows.Media.Imaging.BitmapSource src)
+        {
+            var conv = new System.Windows.Media.Imaging.FormatConvertedBitmap(
+                src, System.Windows.Media.PixelFormats.Bgra32, null, 0);
+            var bmp = new Bitmap(conv.PixelWidth, conv.PixelHeight,
+                System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            var bd = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height),
+                System.Drawing.Imaging.ImageLockMode.WriteOnly, bmp.PixelFormat);
+            try
+            {
+                conv.CopyPixels(System.Windows.Int32Rect.Empty, bd.Scan0,
+                                bd.Stride * bd.Height, bd.Stride);
+            }
+            finally { bmp.UnlockBits(bd); }
+            return bmp;
         }
 
         static Image WicDecode(byte[] data)
@@ -2188,193 +2614,179 @@ namespace SteamGridDBFetcher
             return bmp;
         }
 
-        void SelectTile(string typeKey, Panel tile, string url)
+        // -------------------------------------------------- filters & staging
+
+        bool ShouldShow(SgdbAsset a)
+        {
+            bool typeOk = a.Animated ? cbAnimated.Checked : cbStatic.Checked;
+            bool tagged = a.Nsfw || a.Humor || a.Epilepsy;
+            bool tagOk = tagged
+                ? (a.Nsfw && cbAdult.Checked) || (a.Humor && cbHumor.Checked) ||
+                  (a.Epilepsy && cbEpilepsy.Checked)
+                : cbUntagged.Checked;
+            return typeOk && tagOk;
+        }
+
+        void ApplyAssetFilter()
+        {
+            foreach (var kv in tiles)
+            {
+                foreach (Panel p in kv.Value)
+                {
+                    SgdbAsset a;
+                    if (!p.IsDisposed && tileAssets.TryGetValue(p, out a))
+                        p.Visible = ShouldShow(a);
+                }
+            }
+            // if a staged pick just got hidden, fall back to "current"
+            foreach (string k in staged.Keys.ToList())
+            {
+                Pick pk = staged[k];
+                if (pk.Tile != null && !pk.Tile.IsDisposed && !pk.Tile.Visible
+                    && tileAssets.ContainsKey(pk.Tile))
+                    Unstage(k);
+            }
+        }
+
+        void Stage(string slotKey, string value, string label, Panel tile)
+        {
+            if (busy) return;
+            staged[slotKey] = new Pick { Value = value, SourceLabel = label, Tile = tile };
+            UpdateHighlights(slotKey);
+            UpdateRail();
+        }
+
+        void Unstage(string slotKey)
+        {
+            if (busy) return;
+            staged.Remove(slotKey);
+            UpdateHighlights(slotKey);
+            UpdateRail();
+        }
+
+        void UpdateHighlights(string slotKey)
         {
             List<Panel> list;
-            if (!tiles.TryGetValue(typeKey, out list)) return;
+            if (!tiles.TryGetValue(slotKey, out list)) return;
+            Pick pk;
+            staged.TryGetValue(slotKey, out pk);
+            Panel target = pk != null ? pk.Tile
+                : currentTiles.ContainsKey(slotKey) ? currentTiles[slotKey] : null;
             foreach (Panel p in list)
-                if (!p.IsDisposed) p.BackColor = PANEL;
-            tile.BackColor = ACC;
-
-            // check badge so the pick isn't indicated by the ring color alone
-            Label badge;
-            if (selBadges.TryGetValue(typeKey, out badge))
-            {
-                if (!badge.IsDisposed)
+                if (!p.IsDisposed)
                 {
-                    if (badge.Parent != null) badge.Parent.Controls.Remove(badge);
-                    badge.Dispose();
+                    SgdbAsset a;
+                    p.BackColor = tileAssets.TryGetValue(p, out a) && a.Nsfw ? NSFWB : BG2;
                 }
-                selBadges.Remove(typeKey);
-            }
-            badge = new Label
-            {
-                Text = "✓", BackColor = ACC,
-                ForeColor = ColorTranslator.FromHtml("#06121C"),
-                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-                Size = new Size(22, 22), TextAlign = ContentAlignment.MiddleCenter,
-                Location = new Point(tile.Width - 27, 5)
-            };
-            tile.Controls.Add(badge);
-            badge.BringToFront();
-            selBadges[typeKey] = badge;
-
-            if (url != null) sel[typeKey] = url;
-            else sel.Remove(typeKey);
-            UpdateButtons();
+            if (target != null && !target.IsDisposed) target.BackColor = ACC;
         }
 
-        // ------------------------------------------------------ apply flows
-
-        void MarkApplied(uint appid)
+        void RefreshAllHighlights()
         {
-            applied.Add(appid);
-            RefreshGame(appid);
+            foreach (AType t in Cfg.Types) UpdateHighlights(t.Key);
         }
 
-        async void ApplySelected()
+        // ------------------------------------------------------ apply / undo
+
+        async void ApplyStaged()
         {
             Shortcut game = currentShortcut;
-            if (busy || game == null || sel.Count == 0) return;
+            if (busy || game == null || staged.Count == 0) return;
             busy = true;
             UpdateButtons();
-            SetStatus("Applying to " + game.Name + "...", DIM);
+            SetRailStatus("Applying " + staged.Count + " change(s)...", false);
+            var record = new List<UndoItem>();
+            var written = new List<string>();
             try
             {
-                var written = new List<string>();
-                foreach (var kv in sel.ToList())
+                foreach (var kv in staged.ToList())
                 {
                     AType t = Cfg.Types.First(x => x.Key == kv.Key);
-                    if (kv.Value.StartsWith("official:"))
-                    {
-                        int sid = int.Parse(kv.Value.Substring("official:".Length));
-                        if (await SteamStore.Apply(gridDir, game.AppId, t, sid, stamp))
-                            written.Add(t.Key + " (Steam default)");
-                    }
+                    ApplyResult r;
+                    if (kv.Value.Value.StartsWith("official:"))
+                        r = await SteamStore.Apply(gridDir, game.AppId, t,
+                                int.Parse(kv.Value.Value.Substring("official:".Length)), stamp);
                     else
-                        written.Add(await Artwork.Apply(gridDir, game.AppId, t, kv.Value, stamp));
-                }
-                MarkApplied(game.AppId);
-                SetStatus("Applied: " + string.Join(", ", written) +
-                          "   (press F5 in your Steam library to see it)", OKC);
-            }
-            catch (Exception ex) { SetStatus("Apply failed: " + ex.Message, ERRC); }
-            finally { busy = false; UpdateButtons(); }
-        }
-
-        async void AutoOne()
-        {
-            Shortcut game = currentShortcut;
-            if (busy || game == null || currentSgdbId <= 0) return;
-            busy = true;
-            UpdateButtons();
-            SetStatus("Auto-applying top picks for " + game.Name + "...", DIM);
-            try
-            {
-                var written = new List<string>();
-                foreach (AType t in Cfg.Types)
-                {
-                    var assets = await api.Assets(currentSgdbId, t);
-                    if (assets.Count > 0)
-                        written.Add(await Artwork.Apply(gridDir, game.AppId, t, assets[0].Url, stamp));
-                }
-                MarkApplied(game.AppId);
-                SetStatus(written.Count == 0
-                    ? "Nothing available on SteamGridDB for this match."
-                    : "Applied: " + string.Join(", ", written) +
-                      "   (press F5 in your Steam library to see it)", OKC);
-            }
-            catch (Exception ex) { SetStatus("Auto failed: " + ex.Message, ERRC); }
-            finally { busy = false; UpdateButtons(); }
-        }
-
-        // Fill ONLY missing asset slots, preferring the official Steam default
-        // artwork; SteamGridDB top results are the fallback for games that are
-        // not on the Steam store. Existing artwork is never replaced.
-        async void AutoAll()
-        {
-            if (busy || api == null || shortcuts == null) return;
-            // only what the list is actually showing right now: the Steam
-            // toggle and the search filter both narrow the scope
-            var targets = DisplayGames.Where(sc =>
-            {
-                GameTile t;
-                return gameTiles.TryGetValue(sc.AppId, out t) && t.Root.Visible;
-            }).ToList();
-            if (targets.Count == 0) return;
-
-            DialogResult r = MessageBox.Show(this,
-                "Fill in missing artwork for the " + targets.Count + " game(s) currently " +
-                "shown in the list?\n\n" +
-                "Empty slots get the official Steam default art (SteamGridDB top result " +
-                "if the game isn't on Steam).\n\nArtwork you already have is never touched; " +
-                "games hidden by the search box or the Steam toggle are not touched either.",
-                "Auto-apply all", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-            if (r != DialogResult.Yes) return;
-
-            busy = true;
-            UpdateButtons();
-            int updated = 0, complete = 0, notFound = 0;
-            try
-            {
-                for (int i = 0; i < targets.Count; i++)
-                {
-                    Shortcut sc = targets[i];
-                    var missing = Cfg.Types.Where(t => FindExisting(sc.AppId, t.Suffix) == null).ToList();
-                    if (missing.Count == 0) { complete++; continue; }
-
-                    SetStatus("[" + (i + 1) + "/" + targets.Count + "] " + sc.Name +
-                              "  (" + missing.Count + " empty slot(s))...", DIM);
-                    bool wrote = false;
-
-                    List<SgdbGame> res = null;
-                    try { res = (await api.SearchSmart(sc.Name)).Value; }
-                    catch (Exception) { }
-                    if (res != null && res.Count > 0)
+                        r = await Artwork.Apply(gridDir, game.AppId, t, kv.Value.Value, stamp);
+                    if (r != null)
                     {
-                        // 1) the game's original Steam assets, as linked by SteamGridDB
-                        int steamId = await api.SteamAppId(res[0].Id);
-                        if (steamId > 0)
-                        {
-                            foreach (AType t in missing.ToList())
-                            {
-                                if (await SteamStore.Apply(gridDir, sc.AppId, t, steamId, stamp))
-                                {
-                                    missing.Remove(t);
-                                    wrote = true;
-                                }
-                            }
-                        }
-
-                        // 2) SteamGridDB top results for whatever is still empty
-                        foreach (AType t in missing)
-                        {
-                            try
-                            {
-                                var assets = t.Key == "logo"
-                                    ? await api.OfficialLogos(res[0].Id)
-                                    : new List<SgdbAsset>();
-                                if (assets.Count == 0)
-                                    assets = await api.Assets(res[0].Id, t);
-                                if (assets.Count > 0)
-                                {
-                                    await Artwork.Apply(gridDir, sc.AppId, t, assets[0].Url, stamp);
-                                    wrote = true;
-                                }
-                            }
-                            catch (Exception) { }
-                            await Task.Delay(100);   // be polite to the API/CDN
-                        }
+                        record.Add(new UndoItem { Type = t, BackupPaths = r.BackupPaths });
+                        written.Add(t.Short);
                     }
-
-                    if (wrote) { updated++; MarkApplied(sc.AppId); }
-                    else notFound++;
                 }
-                SetStatus("Done: " + updated + " game(s) filled in, " + complete +
-                          " already complete, " + notFound + " with nothing found. " +
-                          "Press F5 in your Steam library to see the artwork.", OKC);
+                lastUndo = record;
+                lastUndoApp = game.AppId;
+                staged.Clear();
+                applied.Add(game.AppId);
+                RefreshGame(game.AppId);
+                RefreshAllHighlights();
+                UpdateRail();
+                undoLink.Visible = record.Count > 0;
+                SetRailStatus("Applied: " + string.Join(", ", written) +
+                              ". Old files were backed up. Press F5 in your Steam library to see it.", true);
             }
+            catch (Exception ex) { SetRailError("Apply failed: " + ex.Message); }
             finally { busy = false; UpdateButtons(); }
+        }
+
+        void UndoLast()
+        {
+            if (busy || lastUndo == null) return;
+            try
+            {
+                foreach (UndoItem it in lastUndo)
+                {
+                    foreach (string ext in Cfg.ImageExts)
+                    {
+                        string f = Path.Combine(gridDir, lastUndoApp + it.Type.Suffix + ext);
+                        if (File.Exists(f)) File.Delete(f);
+                    }
+                    foreach (string b in it.BackupPaths)
+                        if (File.Exists(b))
+                            File.Copy(b, Path.Combine(gridDir, Path.GetFileName(b)), true);
+                }
+                lastUndo = null;
+                undoLink.Visible = false;
+                applied.Remove(lastUndoApp);
+                RefreshGame(lastUndoApp);
+                UpdateRail();
+                SetRailStatus("Restored the previous artwork from backup.", false);
+            }
+            catch (Exception ex) { SetRailError("Undo failed: " + ex.Message); }
+        }
+
+        // Stage picks for every empty slot: the Steam default when available,
+        // otherwise the top visible community asset. Nothing is written until
+        // Apply is pressed.
+        void AutoFillEmpty()
+        {
+            if (busy || currentShortcut == null) return;
+            bool[] slots = GetSlots(currentShortcut.AppId);
+            int n = 0;
+            for (int i = 0; i < Cfg.Types.Length; i++)
+            {
+                AType t = Cfg.Types[i];
+                if (slots[i] || staged.ContainsKey(t.Key)) continue;
+                Panel off;
+                if (officialTiles.TryGetValue(t.Key, out off) && !off.IsDisposed)
+                {
+                    Stage(t.Key, (string)off.Tag, "Steam default", off);
+                    n++;
+                    continue;
+                }
+                List<Panel> list;
+                if (!tiles.TryGetValue(t.Key, out list)) continue;
+                Panel first = list.FirstOrDefault(p => !p.IsDisposed && p.Visible && tileAssets.ContainsKey(p));
+                if (first != null)
+                {
+                    SgdbAsset a = tileAssets[first];
+                    Stage(t.Key, a.Url, a.Animated ? "community · animated" : "community", first);
+                    n++;
+                }
+            }
+            SetRailStatus(n == 0
+                ? "Nothing to fill - every slot has artwork or a staged pick."
+                : "Staged " + n + " pick(s) for the empty slots - review and press Apply.", false);
         }
     }
 
@@ -2411,6 +2823,9 @@ namespace SteamGridDBFetcher
         {
             try { SetProcessDPIAware(); } catch (Exception) { }
             ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            // default is 2 connections per host, which serializes every
+            // thumbnail/asset download behind two sockets
+            ServicePointManager.DefaultConnectionLimit = 16;
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.AddMessageFilter(new WheelRedirector());
