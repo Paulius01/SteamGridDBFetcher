@@ -742,6 +742,7 @@ namespace SteamGridDBFetcher
         static readonly Color OKC = ColorTranslator.FromHtml("#3fb950");
         static readonly Color WARN = ColorTranslator.FromHtml("#d4a24e");
         static readonly Color ERRC = ColorTranslator.FromHtml("#e5534b");
+        static readonly Color NSFWB = ColorTranslator.FromHtml("#c0392f");   // adult-content tile border
         static readonly Color METER_OFF = ColorTranslator.FromHtml("#2a3040");
 
         const int CoverW = 220, CoverH = 330;
@@ -2072,7 +2073,7 @@ namespace SteamGridDBFetcher
                 tiles[t.Key] = new List<Panel>();
                 sectionsFlow.Controls.Add(flow);
                 string existing = game != null ? FindExisting(game.AppId, t.Suffix) : null;
-                AddCurrentTile(t, flow, existing);
+                AddCurrentTile(t, flow, existing, game);
             }
             UpdateFlowWidths();
             RefreshAllHighlights();
@@ -2123,9 +2124,11 @@ namespace SteamGridDBFetcher
         // ------------------------------------------------------- picker tiles
 
         // First tile of every row: what the game has right now. Clicking it
-        // means "keep as is" (unstage).
-        void AddCurrentTile(AType t, FlowLayoutPanel flow, string existingPath)
+        // means "keep as is" (unstage). For Steam-store games without custom
+        // art, "current" is the game's official Steam default - show it.
+        void AddCurrentTile(AType t, FlowLayoutPanel flow, string existingPath, Shortcut game)
         {
+            bool steamDefault = existingPath == null && game != null && game.IsSteam;
             var p = new Panel
             {
                 Size = new Size(t.W + 10, t.H + 10), BackColor = BG2,
@@ -2133,8 +2136,9 @@ namespace SteamGridDBFetcher
             };
             var caption = new Label
             {
-                Text = existingPath != null ? "current" : "none",
-                ForeColor = existingPath != null ? ACC : WARN,
+                Text = existingPath != null ? "current"
+                     : steamDefault ? "current · Steam default" : "none",
+                ForeColor = existingPath != null || steamDefault ? ACC : WARN,
                 BackColor = FIELD, Font = new Font("Segoe UI", 7.5f),
                 Location = new Point(5, 5 + t.H - 16), Size = new Size(t.W, 16),
                 TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand
@@ -2142,19 +2146,26 @@ namespace SteamGridDBFetcher
             string key = t.Key;
             EventHandler h = delegate { Unstage(key); };
 
-            if (existingPath != null)
+            if (existingPath != null || steamDefault)
             {
                 var pb = new PictureBox
                 {
                     Location = new Point(5, 5), Size = new Size(t.W, t.H - 16),
                     SizeMode = PictureBoxSizeMode.Zoom, BackColor = FIELD, Cursor = Cursors.Hand
                 };
-                try
+                if (existingPath != null)
                 {
-                    byte[] bytes = File.ReadAllBytes(existingPath);
-                    pb.Image = Image.FromStream(new MemoryStream(bytes));
+                    try
+                    {
+                        byte[] bytes = File.ReadAllBytes(existingPath);
+                        pb.Image = Image.FromStream(new MemoryStream(bytes));
+                    }
+                    catch (Exception) { }
                 }
-                catch (Exception) { }
+                else
+                {
+                    LoadSteamDefaultInto(pb, game.AppId, t.Key);
+                }
                 p.Controls.Add(pb);
                 pb.Click += h;
             }
@@ -2176,6 +2187,62 @@ namespace SteamGridDBFetcher
             flow.Controls.Add(p);
             tiles[key].Add(p);
             currentTiles[key] = p;
+        }
+
+        // What Steam's local cache / CDN calls each default asset.
+        static readonly Dictionary<string, string> CacheFlat = new Dictionary<string, string>
+        {
+            { "cover", "_library_600x900.jpg" }, { "wide", "_header.jpg" },
+            { "background", "_library_hero.jpg" }, { "logo", "_logo.png" },
+        };
+        static readonly Dictionary<string, string[]> CachePatterns = new Dictionary<string, string[]>
+        {
+            { "cover",      new string[] { "library_600x900*", "library_capsule.*", "capsule*" } },
+            { "wide",       new string[] { "library_header.*", "header.*" } },
+            { "background", new string[] { "library_hero.*" } },
+            { "logo",       new string[] { "logo.*" } },
+        };
+
+        // The official default asset a Steam-store game is currently showing:
+        // Steam's local librarycache first (both layouts), then the CDNs.
+        byte[] SteamDefaultBytes(uint appid, string typeKey)
+        {
+            try
+            {
+                string cache = Path.Combine(steamPath, "appcache", "librarycache");
+                string flat = Path.Combine(cache, appid + CacheFlat[typeKey]);
+                if (File.Exists(flat)) return File.ReadAllBytes(flat);
+                string sub = Path.Combine(cache, appid.ToString());
+                if (Directory.Exists(sub))
+                    foreach (string pattern in CachePatterns[typeKey])
+                    {
+                        string[] found = Directory.GetFiles(sub, pattern, SearchOption.AllDirectories);
+                        if (found.Length > 0) return File.ReadAllBytes(found[0]);
+                    }
+            }
+            catch (Exception) { }
+            foreach (string u in SteamStore.PreviewUrls((int)appid, typeKey))
+            {
+                try
+                {
+                    using (var wc = new WebClient())
+                    {
+                        wc.Headers["User-Agent"] = "SteamGridDBFetcher/1.0";
+                        return wc.DownloadData(u);
+                    }
+                }
+                catch (Exception) { }
+            }
+            return null;
+        }
+
+        async void LoadSteamDefaultInto(PictureBox pb, uint appid, string typeKey)
+        {
+            int g = gen;
+            byte[] data = await Task.Run(() => SteamDefaultBytes(appid, typeKey));
+            if (data == null || g != gen || pb.IsDisposed) return;
+            try { pb.Image = Image.FromStream(new MemoryStream(data)); }
+            catch (Exception) { }
         }
 
         // The game's original Steam asset, selectable like any other pick.
@@ -2237,7 +2304,8 @@ namespace SteamGridDBFetcher
 
             var p = new Panel
             {
-                Size = new Size(t.W + 10, t.H + 10), BackColor = BG2,
+                // adult-tagged assets get a red border, like on the SGDB site
+                Size = new Size(t.W + 10, t.H + 10), BackColor = a.Nsfw ? NSFWB : BG2,
                 Margin = new Padding(4), Tag = url
             };
             var pb = new PictureBox
@@ -2555,7 +2623,11 @@ namespace SteamGridDBFetcher
             Panel target = pk != null ? pk.Tile
                 : currentTiles.ContainsKey(slotKey) ? currentTiles[slotKey] : null;
             foreach (Panel p in list)
-                if (!p.IsDisposed) p.BackColor = BG2;
+                if (!p.IsDisposed)
+                {
+                    SgdbAsset a;
+                    p.BackColor = tileAssets.TryGetValue(p, out a) && a.Nsfw ? NSFWB : BG2;
+                }
             if (target != null && !target.IsDisposed) target.BackColor = ACC;
         }
 
