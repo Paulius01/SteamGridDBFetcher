@@ -711,14 +711,62 @@ namespace SteamGridDBFetcher
         }
     }
 
-    class GameTile
+    // One owner-drawn control per library card (cover + name + slot meter +
+    // status) instead of five child controls - far fewer native windows, so
+    // creation and composited scrolling are much faster.
+    class GameCard : Control
     {
         public Shortcut Game;
-        public Panel Root;
-        public PictureBox Pic;
-        public Label Name;
-        public Label Status;
-        public Panel Meter;
+        public Image Cover;          // owned by MainForm caches, not by us
+        public Image Placeholder;
+        public string StatusText = "";
+        public Color StatusColor;
+        public Color NameColor;
+        public bool[] Slots;         // null = all filled (Steam defaults)
+        public Color BgNormal, BgHover, MeterOn, MeterOff;
+        bool hover;
+
+        static readonly Font NameFont = new Font("Segoe UI", 9f, FontStyle.Bold);
+        static readonly Font StatusFont = new Font("Segoe UI", 7.6f);
+
+        public GameCard()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.UserPaint, true);
+            Cursor = Cursors.Hand;
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.Clear(hover ? BgHover : BgNormal);
+            int pad = 4;
+            int cw = Width - pad * 2;
+            int ch = cw * 3 / 2;
+            Image img = Cover != null ? Cover : Placeholder;
+            if (img != null)
+            {
+                try { g.DrawImage(img, pad, pad, cw, ch); }
+                catch (Exception) { }
+            }
+            int y = pad + ch + 6;
+            TextRenderer.DrawText(g, Game != null ? Game.Name : "", NameFont,
+                new Rectangle(pad, y, cw, 17), NameColor,
+                TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            int my = y + 23;
+            for (int i = 0; i < 4; i++)
+            {
+                bool on = Slots == null || (i < Slots.Length && Slots[i]);
+                using (var br = new SolidBrush(on ? MeterOn : MeterOff))
+                    g.FillRectangle(br, pad + i * 23, my + 1, 19, 4);
+            }
+            TextRenderer.DrawText(g, StatusText, StatusFont,
+                new Rectangle(pad + 96, my - 5, cw - 96, 15), StatusColor,
+                TextFormatFlags.Right | TextFormatFlags.NoPrefix);
+        }
     }
 
     class Pick
@@ -776,7 +824,7 @@ namespace SteamGridDBFetcher
         Label batchLabel, batchTxt;
         Panel batchBarOuter, batchBarInner;
         System.Windows.Forms.Timer stripHideTimer;
-        readonly Dictionary<uint, GameTile> gameTiles = new Dictionary<uint, GameTile>();
+        readonly Dictionary<uint, GameCard> gameTiles = new Dictionary<uint, GameCard>();
         readonly Dictionary<uint, Image> coverImages = new Dictionary<uint, Image>();
         readonly Dictionary<uint, Image> placeholders = new Dictionary<uint, Image>();
         readonly Dictionary<uint, Image> steamCoverCache = new Dictionary<uint, Image>();
@@ -1430,13 +1478,44 @@ namespace SteamGridDBFetcher
             foreach (Shortcut sc in AllGames)
             {
                 GetSlots(sc.AppId);
-                LoadCoverImage(sc.AppId);
-                if (sc.IsSteam && !coverImages.ContainsKey(sc.AppId))
-                    QueueSteamCover(sc);
+                if (sc.IsSteam) QueueSteamCover(sc);
             }
             BuildLibrary();
             RenderScopeSeg();
             ApplyLibraryFilter();
+
+            // decode custom covers off the UI thread; cards pop in as ready
+            int g = libGen;
+            var snapshot = AllGames.ToList();
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                foreach (Shortcut sc in snapshot)
+                {
+                    if (g != libGen) return;
+                    string p = FindExisting(sc.AppId, "p");
+                    if (p == null) continue;
+                    Bitmap bmp = null;
+                    try
+                    {
+                        using (var src = Image.FromStream(new MemoryStream(File.ReadAllBytes(p))))
+                            bmp = ScaleCover(src);
+                    }
+                    catch (Exception) { continue; }
+                    Shortcut cur = sc;
+                    try
+                    {
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            if (g != libGen) { bmp.Dispose(); return; }
+                            Image prev;
+                            if (coverImages.TryGetValue(cur.AppId, out prev) && prev != null) prev.Dispose();
+                            coverImages[cur.AppId] = bmp;
+                            UpdateTile(cur);
+                        });
+                    }
+                    catch (Exception) { bmp.Dispose(); return; }   // window closed
+                }
+            });
         }
 
         void RefreshLibrary()
@@ -1495,9 +1574,9 @@ namespace SteamGridDBFetcher
             libraryFlow.SuspendLayout();
             foreach (Shortcut g in AllGames)
             {
-                GameTile t;
+                GameCard t;
                 if (gameTiles.TryGetValue(g.AppId, out t))
-                    t.Root.Visible = ScopeMatch(g) &&
+                    t.Visible = ScopeMatch(g) &&
                         (q.Length == 0 || g.Name.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0);
             }
             libraryFlow.ResumeLayout();
@@ -1508,72 +1587,17 @@ namespace SteamGridDBFetcher
             libraryFlow.SuspendLayout();
             foreach (Shortcut sc in AllGames)
             {
-                var tile = new GameTile { Game = sc };
-                tile.Root = new Panel
+                var card = new GameCard
                 {
-                    Size = new Size(CoverW + 8, CoverH + 54), BackColor = BG0,
-                    Margin = new Padding(7), Cursor = Cursors.Hand
+                    Game = sc,
+                    Size = new Size(CoverW + 8, CoverH + 54),
+                    Margin = new Padding(7),
+                    BgNormal = BG0, BgHover = BG2, MeterOn = OKC, MeterOff = METER_OFF
                 };
-                tile.Pic = new PictureBox
-                {
-                    Location = new Point(4, 4), Size = new Size(CoverW, CoverH),
-                    SizeMode = PictureBoxSizeMode.StretchImage, BackColor = BG2,
-                    Cursor = Cursors.Hand
-                };
-                tile.Name = new Label
-                {
-                    Location = new Point(4, CoverH + 10), Size = new Size(CoverW, 17),
-                    ForeColor = TX, BackColor = BG0, AutoEllipsis = true, Text = sc.Name,
-                    Cursor = Cursors.Hand, Font = new Font("Segoe UI", 9f, FontStyle.Bold)
-                };
-                tile.Meter = new Panel
-                {
-                    Location = new Point(4, CoverH + 33), Size = new Size(92, 6),
-                    BackColor = BG0, Cursor = Cursors.Hand
-                };
-                Shortcut mg = sc;
-                tile.Meter.Paint += delegate(object s, PaintEventArgs pe)
-                {
-                    bool[] slots = mg.IsSteam ? new bool[] { true, true, true, true } : GetSlots(mg.AppId);
-                    for (int i = 0; i < 4; i++)
-                        using (var br = new SolidBrush(slots[i] ? OKC : METER_OFF))
-                            pe.Graphics.FillRectangle(br, i * 23, 1, 19, 4);
-                };
-                tile.Status = new Label
-                {
-                    Location = new Point(100, CoverH + 28), Size = new Size(CoverW - 96, 15),
-                    ForeColor = DIM, BackColor = BG0, Font = new Font("Segoe UI", 7.6f),
-                    TextAlign = ContentAlignment.MiddleRight, Cursor = Cursors.Hand
-                };
-                tile.Root.Controls.Add(tile.Pic);
-                tile.Root.Controls.Add(tile.Name);
-                tile.Root.Controls.Add(tile.Meter);
-                tile.Root.Controls.Add(tile.Status);
-
                 Shortcut captured = sc;
-                EventHandler click = delegate { if (!busy) OpenDetail(captured); };
-                foreach (Control c in new Control[] { tile.Root, tile.Pic, tile.Name, tile.Status, tile.Meter })
-                    c.Click += click;
-
-                GameTile t2 = tile;
-                EventHandler enter = delegate
-                {
-                    t2.Root.BackColor = BG2; t2.Name.BackColor = BG2;
-                    t2.Status.BackColor = BG2; t2.Meter.BackColor = BG2;
-                };
-                EventHandler leave = delegate
-                {
-                    t2.Root.BackColor = BG0; t2.Name.BackColor = BG0;
-                    t2.Status.BackColor = BG0; t2.Meter.BackColor = BG0;
-                };
-                foreach (Control c in new Control[] { tile.Root, tile.Pic, tile.Name, tile.Status, tile.Meter })
-                {
-                    c.MouseEnter += enter;
-                    c.MouseLeave += leave;
-                }
-
-                gameTiles[sc.AppId] = tile;
-                libraryFlow.Controls.Add(tile.Root);
+                card.Click += delegate { if (!busy) OpenDetail(captured); };
+                gameTiles[sc.AppId] = card;
+                libraryFlow.Controls.Add(card);
                 UpdateTile(sc);
             }
             libraryFlow.ResumeLayout();
@@ -1581,21 +1605,23 @@ namespace SteamGridDBFetcher
 
         void UpdateTile(Shortcut sc)
         {
-            GameTile t;
+            GameCard t;
             if (!gameTiles.TryGetValue(sc.AppId, out t)) return;
             Image cover;
             if (!coverImages.TryGetValue(sc.AppId, out cover) && sc.IsSteam)
                 steamCoverCache.TryGetValue(sc.AppId, out cover);
-            t.Pic.Image = cover != null ? cover : GetPlaceholder(sc);
+            t.Cover = cover;
+            t.Placeholder = cover == null ? GetPlaceholder(sc) : null;
+            t.Slots = sc.IsSteam ? null : GetSlots(sc.AppId);
             bool isApplied = applied.Contains(sc.AppId);
-            t.Name.ForeColor = isApplied ? OKC : TX;
+            t.NameColor = isApplied ? OKC : TX;
             int missing = MissingCount(sc);
-            if (isApplied) { t.Status.Text = "updated"; t.Status.ForeColor = OKC; }
-            else if (sc.IsSteam) { t.Status.Text = "Steam"; t.Status.ForeColor = DIM; }
-            else if (missing == 4) { t.Status.Text = "no artwork"; t.Status.ForeColor = WARN; }
-            else if (missing > 0) { t.Status.Text = missing + (missing > 1 ? " slots empty" : " slot empty"); t.Status.ForeColor = WARN; }
-            else { t.Status.Text = "complete"; t.Status.ForeColor = DIM; }
-            t.Meter.Invalidate();
+            if (isApplied) { t.StatusText = "updated"; t.StatusColor = OKC; }
+            else if (sc.IsSteam) { t.StatusText = "Steam"; t.StatusColor = DIM; }
+            else if (missing == 4) { t.StatusText = "no artwork"; t.StatusColor = WARN; }
+            else if (missing > 0) { t.StatusText = missing + (missing > 1 ? " slots empty" : " slot empty"); t.StatusColor = WARN; }
+            else { t.StatusText = "complete"; t.StatusColor = DIM; }
+            t.Invalidate();
         }
 
         void RefreshGame(uint appid)
@@ -2079,6 +2105,11 @@ namespace SteamGridDBFetcher
             RefreshAllHighlights();
             SetRailStatus("Loading assets for " + gameName + "...", false);
 
+            // fire every request up front so the network round-trips overlap
+            var pageTasks = new Dictionary<string, Task<AssetPage>>();
+            foreach (AType t in Cfg.Types)
+                pageTasks[t.Key] = api.AssetsPaged(gameId, t, 0);
+
             // offer the game's original Steam assets as picks
             int steamId = 0;
             try { steamId = await api.SteamAppId(gameId); }
@@ -2094,7 +2125,7 @@ namespace SteamGridDBFetcher
             foreach (AType t in Cfg.Types)
             {
                 AssetPage pg;
-                try { pg = await api.AssetsPaged(gameId, t, 0); }
+                try { pg = await pageTasks[t.Key]; }
                 catch (Exception ex)
                 {
                     if (g == gen) countLabels[t.Key].Text = "failed to load (" + ex.Message + ")";
@@ -2449,13 +2480,7 @@ namespace SteamGridDBFetcher
                     if (scale < 1.0)
                         src = new System.Windows.Media.Imaging.TransformedBitmap(
                             frame, new System.Windows.Media.ScaleTransform(scale, scale));
-                    var enc = new System.Windows.Media.Imaging.PngBitmapEncoder();
-                    enc.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(src));
-                    using (var ms = new MemoryStream())
-                    {
-                        enc.Save(ms);
-                        clip.Frames.Add(Image.FromStream(new MemoryStream(ms.ToArray())));
-                    }
+                    clip.Frames.Add(WpfToBitmap(src));
                     int delay = 70;
                     try
                     {
@@ -2515,12 +2540,18 @@ namespace SteamGridDBFetcher
                     return;
                 }
             }
-            try { pb.Image = Image.FromStream(new MemoryStream(data)); }
-            catch (Exception)
+            // decode off the UI thread so tiles never jank the window
+            Image img = await Task.Run(delegate
             {
-                Image wic = WicDecode(data);
-                pb.Image = wic != null ? wic : TextThumb(pb.Width, pb.Height);
+                try { return (Image)new Bitmap(new MemoryStream(data)); }
+                catch (Exception) { return WicDecode(data); }
+            });
+            if (g != gen || pb.IsDisposed)
+            {
+                if (img != null) img.Dispose();
+                return;
             }
+            pb.Image = img != null ? img : TextThumb(pb.Width, pb.Height);
             MaybeUpdateHero(pb);
         }
 
@@ -2530,6 +2561,25 @@ namespace SteamGridDBFetcher
             if (staged.TryGetValue("cover", out pk) && pk.Tile != null && !pk.Tile.IsDisposed
                 && pk.Tile.Controls.Count > 0 && ReferenceEquals(pk.Tile.Controls[0], pb))
                 UpdateHero();
+        }
+
+        // Direct pixel copy from a WPF bitmap into a GDI+ bitmap - far cheaper
+        // than the PNG encode/decode round trip per animation frame.
+        static Bitmap WpfToBitmap(System.Windows.Media.Imaging.BitmapSource src)
+        {
+            var conv = new System.Windows.Media.Imaging.FormatConvertedBitmap(
+                src, System.Windows.Media.PixelFormats.Bgra32, null, 0);
+            var bmp = new Bitmap(conv.PixelWidth, conv.PixelHeight,
+                System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            var bd = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height),
+                System.Drawing.Imaging.ImageLockMode.WriteOnly, bmp.PixelFormat);
+            try
+            {
+                conv.CopyPixels(System.Windows.Int32Rect.Empty, bd.Scan0,
+                                bd.Stride * bd.Height, bd.Stride);
+            }
+            finally { bmp.UnlockBits(bd); }
+            return bmp;
         }
 
         static Image WicDecode(byte[] data)
@@ -2773,6 +2823,9 @@ namespace SteamGridDBFetcher
         {
             try { SetProcessDPIAware(); } catch (Exception) { }
             ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            // default is 2 connections per host, which serializes every
+            // thumbnail/asset download behind two sockets
+            ServicePointManager.DefaultConnectionLimit = 16;
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.AddMessageFilter(new WheelRedirector());
