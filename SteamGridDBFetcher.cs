@@ -50,6 +50,12 @@ namespace SteamGridDBFetcher
     {
         public int Id;
         public string Name;
+        public int Year;      // release year, 0 when unknown
+
+        public string Display
+        {
+            get { return Year > 0 ? Name + " (" + Year + ")" : Name; }
+        }
     }
 
     class SgdbAsset
@@ -493,9 +499,23 @@ namespace SteamGridDBFetcher
             {
                 var g = o as Dictionary<string, object>;
                 if (g == null) continue;
-                object id, name;
+                object id, name, rd;
                 if (g.TryGetValue("id", out id) && g.TryGetValue("name", out name))
-                    list.Add(new SgdbGame { Id = Convert.ToInt32(id), Name = Convert.ToString(name) });
+                {
+                    var sg = new SgdbGame { Id = Convert.ToInt32(id), Name = Convert.ToString(name) };
+                    if (g.TryGetValue("release_date", out rd) && rd != null)
+                    {
+                        try
+                        {
+                            long secs = Convert.ToInt64(rd);
+                            if (secs > 0)
+                                sg.Year = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)
+                                          .AddSeconds(secs).Year;
+                        }
+                        catch { }
+                    }
+                    list.Add(sg);
+                }
             }
             return list;
         }
@@ -729,6 +749,13 @@ namespace SteamGridDBFetcher
         static readonly Font NameFont = new Font("Segoe UI", 9f, FontStyle.Bold);
         static readonly Font StatusFont = new Font("Segoe UI", 7.6f);
 
+        // Vertical space needed below the top pad + cover for the name row and
+        // the meter/status row, derived from the fonts so text never clips.
+        public static int ExtraH
+        {
+            get { return 6 + NameFont.Height + 2 + 6 + Math.Max(6, StatusFont.Height - 2) + 10; }
+        }
+
         public GameCard()
         {
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
@@ -753,10 +780,11 @@ namespace SteamGridDBFetcher
                 catch (Exception) { }
             }
             int y = pad + ch + 6;
+            int nameH = NameFont.Height + 2;
             TextRenderer.DrawText(g, Game != null ? Game.Name : "", NameFont,
-                new Rectangle(pad, y, cw, 17), NameColor,
+                new Rectangle(pad, y, cw, nameH), NameColor,
                 TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
-            int my = y + 23;
+            int my = y + nameH + 6;
             for (int i = 0; i < 4; i++)
             {
                 bool on = Slots == null || (i < Slots.Length && Slots[i]);
@@ -764,7 +792,7 @@ namespace SteamGridDBFetcher
                     g.FillRectangle(br, pad + i * 23, my + 1, 19, 4);
             }
             TextRenderer.DrawText(g, StatusText, StatusFont,
-                new Rectangle(pad + 96, my - 5, cw - 96, 15), StatusColor,
+                new Rectangle(pad + 96, my - 5, cw - 96, StatusFont.Height + 3), StatusColor,
                 TextFormatFlags.Right | TextFormatFlags.NoPrefix);
         }
     }
@@ -993,18 +1021,25 @@ namespace SteamGridDBFetcher
                 var lbl = new Label
                 {
                     Text = "Paste your SteamGridDB API key.\nGet one free at:  steamgriddb.com -> Profile -> Preferences -> API",
-                    Location = new Point(14, 12), Size = new Size(430, 40), ForeColor = TX
+                    Location = new Point(14, 12), AutoSize = true,
+                    MaximumSize = new Size(430, 0), ForeColor = TX
                 };
                 var box = new TextBox
                 {
-                    Location = new Point(14, 60), Size = new Size(430, 26),
+                    Location = new Point(14, 12 + lbl.PreferredHeight + 10), Width = 430,
                     BackColor = FIELD, ForeColor = TX, BorderStyle = BorderStyle.FixedSingle
                 };
                 var ok = MakeButton("OK", true);
-                ok.Location = new Point(254, 104); ok.Size = new Size(90, 32); ok.AutoSize = false;
-                ok.DialogResult = DialogResult.OK;
+                ok.AutoSize = false;
                 var cancel = MakeButton("Cancel", false);
-                cancel.Location = new Point(354, 104); cancel.Size = new Size(90, 32); cancel.AutoSize = false;
+                cancel.AutoSize = false;
+                int bh = Math.Max(32, Math.Max(ok.GetPreferredSize(Size.Empty).Height,
+                                               cancel.GetPreferredSize(Size.Empty).Height));
+                int by = box.Bottom + 16;
+                f.ClientSize = new Size(460, by + bh + 12);
+                ok.Size = new Size(90, bh); ok.Location = new Point(254, by);
+                ok.DialogResult = DialogResult.OK;
+                cancel.Size = new Size(90, bh); cancel.Location = new Point(354, by);
                 cancel.DialogResult = DialogResult.Cancel;
                 f.Controls.Add(lbl); f.Controls.Add(box); f.Controls.Add(ok); f.Controls.Add(cancel);
                 f.AcceptButton = ok; f.CancelButton = cancel;
@@ -1042,6 +1077,11 @@ namespace SteamGridDBFetcher
                 Margin = new Padding(0, 5, 14, 0)
             };
         }
+
+        // Shared caption font + strip height for asset tiles, sized from the
+        // font so the text never clips regardless of DPI.
+        static readonly Font CapFont = new Font("Segoe UI", 7.5f);
+        static readonly int CapH = Math.Max(16, CapFont.Height + 4);
 
         Label RailHeading(string text)
         {
@@ -1144,7 +1184,7 @@ namespace SteamGridDBFetcher
             batchLabel = new Label
             {
                 Text = "", ForeColor = TX, BackColor = BG1, AutoSize = false,
-                Location = new Point(18, 10), Size = new Size(560, 20),
+                Location = new Point(18, 10), Size = new Size(560, Math.Max(20, Font.Height + 4)),
                 AutoEllipsis = true
             };
             batchStrip.Controls.Add(batchLabel);
@@ -1246,23 +1286,26 @@ namespace SteamGridDBFetcher
             railFlow.Controls.Add(dSearch);
 
             railFlow.Controls.Add(RailHeading("Artwork slots"));
+            int rowH = Math.Max(32, Font.Height + 16);
             foreach (AType t in Cfg.Types)
             {
-                var row = new Panel { Size = new Size(272, 32), BackColor = BG2, Margin = new Padding(0, 0, 0, 5) };
+                var row = new Panel { Size = new Size(272, rowH), BackColor = BG2, Margin = new Padding(0, 0, 0, 5) };
                 var dot = new Label
                 {
-                    Text = "●", AutoSize = true, BackColor = BG2, ForeColor = DIM,
-                    Font = new Font("Segoe UI", 8f), Location = new Point(10, 8)
+                    Text = "●", AutoSize = false, BackColor = BG2, ForeColor = DIM,
+                    Font = new Font("Segoe UI", 8f), Size = new Size(20, rowH),
+                    Location = new Point(10, 0), TextAlign = ContentAlignment.MiddleLeft
                 };
                 var nm = new Label
                 {
-                    Text = t.Short, AutoSize = true, BackColor = BG2, ForeColor = TX,
-                    Location = new Point(30, 7)
+                    Text = t.Short, AutoSize = false, BackColor = BG2, ForeColor = TX,
+                    Size = new Size(120, rowH), Location = new Point(30, 0),
+                    TextAlign = ContentAlignment.MiddleLeft
                 };
                 var st = new Label
                 {
                     Text = "", AutoSize = false, BackColor = BG2, ForeColor = DIM,
-                    Size = new Size(110, 18), Location = new Point(152, 7),
+                    Size = new Size(110, rowH), Location = new Point(152, 0),
                     TextAlign = ContentAlignment.MiddleRight,
                     Font = new Font("Segoe UI", 8.2f, FontStyle.Bold)
                 };
@@ -1283,14 +1326,14 @@ namespace SteamGridDBFetcher
 
             applyBtn = MakeButton("Apply changes", true);
             applyBtn.AutoSize = false;
-            applyBtn.Size = new Size(272, 38);
+            applyBtn.Size = new Size(272, Math.Max(38, applyBtn.GetPreferredSize(Size.Empty).Height));
             applyBtn.Margin = new Padding(0, 0, 0, 8);
             applyBtn.Click += delegate { ApplyStaged(); };
             railFlow.Controls.Add(applyBtn);
 
             autoFillBtn = MakeButton("Auto-fill empty slots", false);
             autoFillBtn.AutoSize = false;
-            autoFillBtn.Size = new Size(272, 34);
+            autoFillBtn.Size = new Size(272, Math.Max(34, autoFillBtn.GetPreferredSize(Size.Empty).Height));
             autoFillBtn.Margin = new Padding(0, 0, 0, 8);
             autoFillBtn.Click += delegate { AutoFillEmpty(); };
             railFlow.Controls.Add(autoFillBtn);
@@ -1353,6 +1396,7 @@ namespace SteamGridDBFetcher
                 ApplyAssetFilter();
             };
             filterRow.Controls.Add(allBtn);
+            filterbar.Height = Math.Max(46, filterRow.PreferredSize.Height + 16);
             foreach (CheckBox c in AllFilterBoxes())
                 c.CheckedChanged += delegate
                 {
@@ -1538,7 +1582,7 @@ namespace SteamGridDBFetcher
             counts[1] = shortcuts.Count(g => MissingCount(g) > 0);
             counts[2] = shortcuts.Count;
             counts[3] = steamGames.Count;
-            int x = 3;
+            int x = 3, h = 30;
             for (int i = 0; i < scopeButtons.Count; i++)
             {
                 Button b = scopeButtons[i];
@@ -1548,8 +1592,12 @@ namespace SteamGridDBFetcher
                 b.ForeColor = on ? TX : DIM;
                 b.Location = new Point(x, 3);
                 x += b.Width + 2;
+                if (b.Height > h) h = b.Height;
             }
             scopeSeg.Width = x + 3;
+            scopeSeg.Height = h + 6;
+            if (scopeSeg.Parent != null)
+                scopeSeg.Top = Math.Max(4, (scopeSeg.Parent.Height - scopeSeg.Height) / 2);
         }
 
         bool ScopeMatch(Shortcut g)
@@ -1590,7 +1638,7 @@ namespace SteamGridDBFetcher
                 var card = new GameCard
                 {
                     Game = sc,
-                    Size = new Size(CoverW + 8, CoverH + 54),
+                    Size = new Size(CoverW + 8, CoverH + 4 + GameCard.ExtraH),
                     Margin = new Padding(7),
                     BgNormal = BG0, BgHover = BG2, MeterOn = OKC, MeterOff = METER_OFF
                 };
@@ -2047,7 +2095,13 @@ namespace SteamGridDBFetcher
             matches.AddRange(results);
             suppressMatch = true;
             matchCombo.Items.Clear();
-            foreach (SgdbGame m in matches) matchCombo.Items.Add(m.Name);
+            int ddw = matchCombo.Width;
+            foreach (SgdbGame m in matches)
+            {
+                matchCombo.Items.Add(m.Display);
+                ddw = Math.Max(ddw, TextRenderer.MeasureText(m.Display, matchCombo.Font).Width + 24);
+            }
+            matchCombo.DropDownWidth = Math.Min(ddw, 480);
             suppressMatch = false;
 
             if (matches.Count == 0)
@@ -2170,8 +2224,8 @@ namespace SteamGridDBFetcher
                 Text = existingPath != null ? "current"
                      : steamDefault ? "current · Steam default" : "none",
                 ForeColor = existingPath != null || steamDefault ? ACC : WARN,
-                BackColor = FIELD, Font = new Font("Segoe UI", 7.5f),
-                Location = new Point(5, 5 + t.H - 16), Size = new Size(t.W, 16),
+                BackColor = FIELD, Font = CapFont,
+                Location = new Point(5, 5 + t.H - CapH), Size = new Size(t.W, CapH),
                 TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand
             };
             string key = t.Key;
@@ -2181,7 +2235,7 @@ namespace SteamGridDBFetcher
             {
                 var pb = new PictureBox
                 {
-                    Location = new Point(5, 5), Size = new Size(t.W, t.H - 16),
+                    Location = new Point(5, 5), Size = new Size(t.W, t.H - CapH),
                     SizeMode = PictureBoxSizeMode.Zoom, BackColor = FIELD, Cursor = Cursors.Hand
                 };
                 if (existingPath != null)
@@ -2205,7 +2259,7 @@ namespace SteamGridDBFetcher
                 var empty = new Label
                 {
                     Text = "keep\nempty", ForeColor = DIM, BackColor = FIELD,
-                    Location = new Point(5, 5), Size = new Size(t.W, t.H - 16),
+                    Location = new Point(5, 5), Size = new Size(t.W, t.H - CapH),
                     TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand,
                     Font = new Font("Segoe UI", 8f)
                 };
@@ -2300,15 +2354,15 @@ namespace SteamGridDBFetcher
             };
             var pb = new PictureBox
             {
-                Location = new Point(5, 5), Size = new Size(t.W, t.H - 16),
+                Location = new Point(5, 5), Size = new Size(t.W, t.H - CapH),
                 SizeMode = PictureBoxSizeMode.Zoom, BackColor = FIELD,
                 Cursor = Cursors.Hand, Image = img
             };
             var caption = new Label
             {
                 Text = "Steam default", ForeColor = OKC, BackColor = FIELD,
-                Font = new Font("Segoe UI", 7.5f),
-                Location = new Point(5, 5 + t.H - 16), Size = new Size(t.W, 16),
+                Font = CapFont,
+                Location = new Point(5, 5 + t.H - CapH), Size = new Size(t.W, CapH),
                 TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand
             };
             p.Controls.Add(pb);
@@ -2341,7 +2395,7 @@ namespace SteamGridDBFetcher
             };
             var pb = new PictureBox
             {
-                Location = new Point(5, 5), Size = new Size(t.W, hasCap ? t.H - 16 : t.H),
+                Location = new Point(5, 5), Size = new Size(t.W, hasCap ? t.H - CapH : t.H),
                 SizeMode = PictureBoxSizeMode.Zoom, BackColor = FIELD, Cursor = Cursors.Hand
             };
             p.Controls.Add(pb);
@@ -2354,8 +2408,8 @@ namespace SteamGridDBFetcher
                 var cap = new Label
                 {
                     Text = string.Join(" · ", capBits), ForeColor = a.Animated ? ACC : WARN,
-                    BackColor = FIELD, Font = new Font("Segoe UI", 7.5f),
-                    Location = new Point(5, 5 + t.H - 16), Size = new Size(t.W, 16),
+                    BackColor = FIELD, Font = CapFont,
+                    Location = new Point(5, 5 + t.H - CapH), Size = new Size(t.W, CapH),
                     TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand
                 };
                 p.Controls.Add(cap);
