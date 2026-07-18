@@ -1022,12 +1022,15 @@ namespace SteamGridDBFetcher
                 {
                     Text = "Paste your SteamGridDB API key.\nGet one free at:  steamgriddb.com -> Profile -> Preferences -> API",
                     Location = new Point(14, 12), AutoSize = true,
-                    MaximumSize = new Size(430, 0), ForeColor = TX
+                    MaximumSize = new Size(430, 0), ForeColor = TX, Font = f.Font
                 };
+                // PreferredHeight ignores wrapping; measure at the wrap width instead
+                int lblH = lbl.GetPreferredSize(new Size(430, 0)).Height;
                 var box = new TextBox
                 {
-                    Location = new Point(14, 12 + lbl.PreferredHeight + 10), Width = 430,
-                    BackColor = FIELD, ForeColor = TX, BorderStyle = BorderStyle.FixedSingle
+                    Location = new Point(14, 12 + lblH + 12), Width = 430,
+                    BackColor = FIELD, ForeColor = TX, BorderStyle = BorderStyle.FixedSingle,
+                    Font = new Font("Segoe UI", 10f)
                 };
                 var ok = MakeButton("OK", true);
                 ok.AutoSize = false;
@@ -1042,6 +1045,7 @@ namespace SteamGridDBFetcher
                 cancel.Size = new Size(90, bh); cancel.Location = new Point(354, by);
                 cancel.DialogResult = DialogResult.Cancel;
                 f.Controls.Add(lbl); f.Controls.Add(box); f.Controls.Add(ok); f.Controls.Add(cancel);
+                box.BringToFront();
                 f.AcceptButton = ok; f.CancelButton = cancel;
                 return f.ShowDialog(this) == DialogResult.OK ? box.Text.Trim() : null;
             }
