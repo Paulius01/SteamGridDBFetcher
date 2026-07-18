@@ -1,5 +1,5 @@
 # SteamGridDB Fetcher
-
+![Preview](preview.png)
 A small Windows app for filling in missing Steam library artwork, entirely vibecoded, so keep that in mind. It pulls covers, wide covers (headers), backgrounds and logos from [SteamGridDB](https://www.steamgriddb.com) and applies them to your Steam library — mainly for non-Steam shortcuts, which have no artwork at all by default, but it works on regular Steam games too.
 
 ## What it does
