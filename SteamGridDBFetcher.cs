@@ -2084,6 +2084,9 @@ namespace SteamGridDBFetcher
         {
             flows.Clear(); countLabels.Clear(); tiles.Clear(); tileAssets.Clear();
             currentTiles.Clear(); officialTiles.Clear();
+            // stop animating; clips/stills stay in their caches for a fast return.
+            anims.Clear();
+            animStill.Clear();
             var old = sectionsFlow.Controls.Cast<Control>().ToList();
             sectionsFlow.Controls.Clear();
             foreach (Control c in old) c.Dispose();
@@ -2534,8 +2537,7 @@ namespace SteamGridDBFetcher
                 AnimEntry a = anims[i];
                 if (a.Pb.IsDisposed)
                 {
-                    anims.RemoveAt(i);
-                    a.Clip.Dispose();
+                    anims.RemoveAt(i);   // clip is owned by clipCache, don't dispose
                     continue;
                 }
                 if (now - a.NextAt >= 0)
@@ -2591,58 +2593,203 @@ namespace SteamGridDBFetcher
 
         async void LoadThumb(PictureBox pb, SgdbAsset asset, int g)
         {
-            // animated "thumbs" are webm videos, useless to an image decoder -
-            // fetch the real asset file and animate it ourselves
+            // Animated assets have no image thumbnail (their only thumb is a webm
+            // video Windows can't decode), so their preview comes from the first
+            // frame of the full webp; hover then animates only the pointed-at tile.
+            // Full resolution is always used when an asset is actually applied.
+            if (asset.Animated)
+                HookHover(pb, asset.Url);
+
+            // static assets use SGDB's small thumbnail; animated use the full webp
             string url = asset.Animated ? asset.Url : asset.Thumb;
+
+            // Preview cache survives leaving/returning to a game, so revisiting a
+            // library entry never re-downloads what was already fetched.
+            Image cached = ImgCacheGet(url);
+            if (cached != null)
+            {
+                if (pb.IsDisposed) return;
+                pb.Image = cached;
+                if (asset.Animated) animStill[pb] = cached;
+                MaybeUpdateHero(pb);
+                return;
+            }
+
             byte[] data;
             await thumbSem.WaitAsync();
             try
             {
-                if (g != gen) return;
+                if (g != gen || pb.IsDisposed) return;
                 data = await Sgdb.Download(url);
             }
             catch (Exception) { return; }
             finally { thumbSem.Release(); }
             if (g != gen || pb.IsDisposed) return;
 
-            if (asset.Animated)
-            {
-                int mw = Math.Max(64, pb.Width * 3 / 5);   // decode below display
-                int mh = Math.Max(64, pb.Height * 3 / 5);  // size to save memory
-                AnimClip clip = await Task.Run(() => DecodeClip(data, mw, mh));
-                if (g != gen || pb.IsDisposed)
-                {
-                    if (clip != null) clip.Dispose();
-                    return;
-                }
-                if (clip != null && clip.Frames.Count > 0)
-                {
-                    pb.Image = clip.Frames[0];
-                    if (clip.Frames.Count > 1)
-                        anims.Add(new AnimEntry
-                        {
-                            Pb = pb, Clip = clip,
-                            NextAt = Environment.TickCount + clip.Delays[0]
-                        });
-                    else
-                        clip.Frames.Clear();   // single frame: keep image, drop clip
-                    MaybeUpdateHero(pb);
-                    return;
-                }
-            }
-            // decode off the UI thread so tiles never jank the window
+            // decode off the UI thread so tiles never jank the window. For a webp
+            // (all animated assets, some static) GDI+ fails and WIC gives frame 0.
+            // Shrink to display size so the cache stays small.
+            int dw = Math.Max(64, pb.Width), dh = Math.Max(64, pb.Height);
             Image img = await Task.Run(delegate
             {
-                try { return (Image)new Bitmap(new MemoryStream(data)); }
-                catch (Exception) { return WicDecode(data); }
+                Image raw;
+                try { raw = new Bitmap(new MemoryStream(data)); }
+                catch (Exception) { raw = WicDecode(data); }
+                return FitDownscale(raw, dw, dh);
             });
             if (g != gen || pb.IsDisposed)
             {
                 if (img != null) img.Dispose();
                 return;
             }
-            pb.Image = img != null ? img : TextThumb(pb.Width, pb.Height);
+            if (img != null)
+            {
+                ImgCachePut(url, img);   // the cache owns it from here on
+                pb.Image = img;
+                if (asset.Animated) animStill[pb] = img;   // to restore after hover
+            }
+            else pb.Image = TextThumb(pb.Width, pb.Height);
             MaybeUpdateHero(pb);
+        }
+
+        // Shrink an image to fit within maxW x maxH (never upscales). Disposes the
+        // source when it replaces it.
+        static Image FitDownscale(Image img, int maxW, int maxH)
+        {
+            if (img == null) return null;
+            if (img.Width <= maxW && img.Height <= maxH) return img;
+            double s = Math.Min((double)maxW / img.Width, (double)maxH / img.Height);
+            int w = Math.Max(1, (int)(img.Width * s)), h = Math.Max(1, (int)(img.Height * s));
+            var bmp = new Bitmap(w, h);
+            using (var g2 = Graphics.FromImage(bmp))
+            {
+                g2.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                g2.DrawImage(img, 0, 0, w, h);
+            }
+            img.Dispose();
+            return bmp;
+        }
+
+        // ---- preview + clip caches (survive leaving/returning to a game) ----
+        // Decoded still previews keyed by asset URL. These are small (downscaled
+        // to display size) and shared by whatever tile shows them, so we never
+        // dispose on eviction - a still might still be on screen; we just drop the
+        // reference and let the GC reclaim it once no tile holds it.
+        readonly Dictionary<string, Image> imgCache = new Dictionary<string, Image>();
+        readonly LinkedList<string> imgOrder = new LinkedList<string>();
+        const int ImgCacheCap = 400;
+        // Decoded animation clips keyed by asset URL, so re-hovering a tile (or
+        // returning to a game) doesn't re-download the multi-MB webp. Only one
+        // tile animates at a time, so the active clip is always the most-recent
+        // entry and never the one evicted - safe to dispose evicted clips.
+        readonly Dictionary<string, AnimClip> clipCache = new Dictionary<string, AnimClip>();
+        readonly LinkedList<string> clipOrder = new LinkedList<string>();
+        const int ClipCacheCap = 10;
+        // The still shown at rest per animated tile, so hover can restore it.
+        readonly Dictionary<PictureBox, Image> animStill = new Dictionary<PictureBox, Image>();
+
+        Image ImgCacheGet(string url)
+        {
+            Image im;
+            if (imgCache.TryGetValue(url, out im))
+            {
+                imgOrder.Remove(url); imgOrder.AddLast(url);   // mark most-recent
+                return im;
+            }
+            return null;
+        }
+
+        void ImgCachePut(string url, Image im)
+        {
+            if (imgCache.ContainsKey(url)) imgOrder.Remove(url);
+            imgCache[url] = im; imgOrder.AddLast(url);
+            while (imgOrder.Count > ImgCacheCap)
+            {
+                string oldest = imgOrder.First.Value;
+                imgOrder.RemoveFirst();
+                imgCache.Remove(oldest);   // no dispose: may still be on screen
+            }
+        }
+
+        AnimClip ClipCacheGet(string url)
+        {
+            AnimClip c;
+            if (clipCache.TryGetValue(url, out c))
+            {
+                clipOrder.Remove(url); clipOrder.AddLast(url);
+                return c;
+            }
+            return null;
+        }
+
+        void ClipCachePut(string url, AnimClip clip)
+        {
+            if (clipCache.ContainsKey(url)) clipOrder.Remove(url);
+            clipCache[url] = clip; clipOrder.AddLast(url);
+            while (clipOrder.Count > ClipCacheCap)
+            {
+                string oldest = clipOrder.First.Value;
+                clipOrder.RemoveFirst();
+                AnimClip ev;
+                if (clipCache.TryGetValue(oldest, out ev))
+                {
+                    clipCache.Remove(oldest);
+                    if (!anims.Exists(x => x.Clip == ev)) ev.Dispose();
+                }
+            }
+        }
+
+        void HookHover(PictureBox pb, string url)
+        {
+            pb.MouseEnter += delegate { HoverEnter(pb, url); };
+            pb.MouseLeave += delegate { HoverLeave(pb); };
+        }
+
+        async void HoverEnter(PictureBox pb, string url)
+        {
+            if (pb.IsDisposed) return;
+            if (anims.Exists(x => x.Pb == pb)) return;   // already animating
+            int gg = gen;
+            AnimClip clip = ClipCacheGet(url);
+            if (clip == null)
+            {
+                byte[] data;
+                await thumbSem.WaitAsync();
+                try
+                {
+                    if (gg != gen || pb.IsDisposed) return;
+                    data = await Sgdb.Download(url);
+                }
+                catch (Exception) { return; }
+                finally { thumbSem.Release(); }
+                if (gg != gen || pb.IsDisposed) return;
+                int mw = Math.Max(64, pb.Width * 3 / 5);
+                int mh = Math.Max(64, pb.Height * 3 / 5);
+                clip = await Task.Run(delegate { return DecodeClip(data, mw, mh); });
+                if (clip != null && clip.Frames.Count >= 2)
+                    ClipCachePut(url, clip);
+            }
+            if (gg != gen || pb.IsDisposed || clip == null || clip.Frames.Count < 2)
+                return;
+            // pointer may have left while we were downloading/decoding
+            if (!pb.ClientRectangle.Contains(pb.PointToClient(Cursor.Position))) return;
+            if (anims.Exists(x => x.Pb == pb)) return;
+            pb.Image = clip.Frames[0];
+            anims.Add(new AnimEntry
+            {
+                Pb = pb, Clip = clip, Idx = 0,
+                NextAt = Environment.TickCount + clip.Delays[0]
+            });
+        }
+
+        void HoverLeave(PictureBox pb)
+        {
+            // stop animating; the clip stays in clipCache for a quick re-hover
+            for (int i = anims.Count - 1; i >= 0; i--)
+                if (anims[i].Pb == pb) anims.RemoveAt(i);
+            Image still;
+            if (!pb.IsDisposed && animStill.TryGetValue(pb, out still) && still != null)
+                pb.Image = still;
         }
 
         void MaybeUpdateHero(PictureBox pb)
