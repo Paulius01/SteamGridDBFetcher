@@ -639,12 +639,24 @@ namespace SteamGridDBFetcher
             return ".png";
         }
 
+        // Steam's grid folder loader recognizes files by extension, and it only
+        // looks for .png/.jpg/.jpeg - never .webp. Animated artwork from SGDB is
+        // webp; the established trick (same one Steam itself uses) is to write
+        // the webp bytes UNCHANGED into a .png-named file. Steam's decoder sniffs
+        // the real content and animates it. So map webp -> .png on disk; the file
+        // content is never touched or re-encoded.
+        static string GridExt(string url)
+        {
+            string ext = ExtFromUrl(url);
+            return ext == ".webp" ? ".png" : ext;
+        }
+
         // Download one asset and write it as the correct grid file.
         // Any replaced files are backed up to backups\<stamp>\ first.
         public static async Task<ApplyResult> Apply(string gdir, uint appid, AType t, string url, string stamp)
         {
             byte[] data = await Sgdb.Download(url);
-            string target = Path.Combine(gdir, appid + t.Suffix + ExtFromUrl(url));
+            string target = Path.Combine(gdir, appid + t.Suffix + GridExt(url));
             var res = new ApplyResult { NewPath = target, Name = Path.GetFileName(target) };
 
             string bdir = Path.Combine(Cfg.BackupRoot, stamp);
@@ -1545,8 +1557,14 @@ namespace SteamGridDBFetcher
                     Bitmap bmp = null;
                     try
                     {
-                        using (var src = Image.FromStream(new MemoryStream(File.ReadAllBytes(p))))
-                            bmp = ScaleCover(src);
+                        byte[] cbytes = File.ReadAllBytes(p);
+                        Image src;
+                        // animated covers are webp bytes in a .png file (GDI+ can't
+                        // read webp) - fall back to the WIC decoder
+                        try { src = Image.FromStream(new MemoryStream(cbytes)); }
+                        catch (Exception) { src = WicDecode(cbytes); }
+                        if (src == null) continue;
+                        using (src) bmp = ScaleCover(src);
                     }
                     catch (Exception) { continue; }
                     Shortcut cur = sc;
@@ -1720,8 +1738,13 @@ namespace SteamGridDBFetcher
             try
             {
                 byte[] bytes = File.ReadAllBytes(p);   // read bytes so the file isn't locked
-                using (var src = Image.FromStream(new MemoryStream(bytes)))
-                    coverImages[appid] = ScaleCover(src);
+                Image src;
+                // an applied animated cover is webp bytes in a .png file; GDI+
+                // can't read webp, so fall back to the WIC decoder
+                try { src = Image.FromStream(new MemoryStream(bytes)); }
+                catch (Exception) { src = WicDecode(bytes); }
+                if (src != null)
+                    using (src) coverImages[appid] = ScaleCover(src);
             }
             catch (Exception) { }
         }
@@ -2022,7 +2045,13 @@ namespace SteamGridDBFetcher
             Image img = null;
             if (p != null)
             {
-                try { img = Image.FromStream(new MemoryStream(File.ReadAllBytes(p))); }
+                try
+                {
+                    byte[] hb = File.ReadAllBytes(p);
+                    // animated covers are webp bytes in a .png file (GDI+ can't read webp)
+                    try { img = Image.FromStream(new MemoryStream(hb)); }
+                    catch (Exception) { img = WicDecode(hb); }
+                }
                 catch (Exception) { }
             }
             if (img == null && currentShortcut.IsSteam)
@@ -2247,7 +2276,10 @@ namespace SteamGridDBFetcher
                     try
                     {
                         byte[] bytes = File.ReadAllBytes(existingPath);
-                        pb.Image = Image.FromStream(new MemoryStream(bytes));
+                        try { pb.Image = Image.FromStream(new MemoryStream(bytes)); }
+                        // applied animated art is webp bytes in a .png file, which
+                        // GDI+ can't read - fall back to the WIC (webp) decoder
+                        catch (Exception) { pb.Image = WicDecode(bytes); }
                     }
                     catch (Exception) { }
                 }
