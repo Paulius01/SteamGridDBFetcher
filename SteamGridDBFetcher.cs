@@ -755,17 +755,18 @@ namespace SteamGridDBFetcher
         public Color StatusColor;
         public Color NameColor;
         public bool[] Slots;         // null = all filled (Steam defaults)
-        public Color BgNormal, BgHover, MeterOn, MeterOff;
+        public Color BgNormal, BgHover, Border, BorderHover, MeterOn, MeterOn2, MeterOff;
         bool hover;
 
         static readonly Font NameFont = new Font("Segoe UI", 9f, FontStyle.Bold);
         static readonly Font StatusFont = new Font("Segoe UI", 7.6f);
 
-        // Vertical space needed below the top pad + cover for the name row and
-        // the meter/status row, derived from the fonts so text never clips.
-        public static int ExtraH
+        public const int Pad = 8;
+
+        // Height below the poster: gap + name row + gap + meter row + bottom pad.
+        public static int BelowH
         {
-            get { return 6 + NameFont.Height + 2 + 6 + Math.Max(6, StatusFont.Height - 2) + 10; }
+            get { return 8 + NameFont.Height + 2 + 7 + 6 + Pad; }
         }
 
         public GameCard()
@@ -781,31 +782,70 @@ namespace SteamGridDBFetcher
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
-            g.Clear(hover ? BgHover : BgNormal);
-            int pad = 4;
-            int cw = Width - pad * 2;
-            int ch = cw * 3 / 2;
-            Image img = Cover != null ? Cover : Placeholder;
-            if (img != null)
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+            // paint the window backdrop first so the rounded corners read as round
+            using (var back = new SolidBrush(Parent != null ? Parent.BackColor : BgNormal))
+                g.FillRectangle(back, ClientRectangle);
+
+            // rounded card body + border (border brightens to accent on hover)
+            var card = new Rectangle(1, 1, Width - 3, Height - 3);
+            using (var path = Round(card, 14))
             {
-                try { g.DrawImage(img, pad, pad, cw, ch); }
-                catch (Exception) { }
+                using (var bg = new SolidBrush(hover ? BgHover : BgNormal)) g.FillPath(bg, path);
+                using (var pen = new Pen(hover ? BorderHover : Border, hover ? 1.5f : 1f)) g.DrawPath(pen, path);
             }
-            int y = pad + ch + 6;
+
+            int cw = Width - Pad * 2;
+            int ch = cw * 3 / 2;
+            var poster = new Rectangle(Pad, Pad, cw, ch);
+            using (var pp = Round(poster, 9))
+            {
+                g.SetClip(pp, System.Drawing.Drawing2D.CombineMode.Replace);
+                Image img = Cover != null ? Cover : Placeholder;
+                if (img != null) { try { g.DrawImage(img, poster); } catch (Exception) { } }
+                else using (var pb = new SolidBrush(MeterOff)) g.FillRectangle(pb, poster);
+            }
+            g.ResetClip();
+
+            int y = Pad + ch + 8;
             int nameH = NameFont.Height + 2;
             TextRenderer.DrawText(g, Game != null ? Game.Name : "", NameFont,
-                new Rectangle(pad, y, cw, nameH), NameColor,
+                new Rectangle(Pad, y, cw, nameH), NameColor,
                 TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
-            int my = y + nameH + 6;
+            int my = y + nameH + 7;
             for (int i = 0; i < 4; i++)
             {
                 bool on = Slots == null || (i < Slots.Length && Slots[i]);
-                using (var br = new SolidBrush(on ? MeterOn : MeterOff))
-                    g.FillRectangle(br, pad + i * 23, my + 1, 19, 4);
+                var r = new Rectangle(Pad + i * 24, my, 20, 5);
+                using (var bp = Round(r, 2))
+                {
+                    if (on)
+                        using (var lg = new System.Drawing.Drawing2D.LinearGradientBrush(
+                                   new Rectangle(r.X, r.Y, r.Width + 1, r.Height), MeterOn, MeterOn2, 0f))
+                            g.FillPath(lg, bp);
+                    else
+                        using (var b = new SolidBrush(MeterOff)) g.FillPath(b, bp);
+                }
             }
             TextRenderer.DrawText(g, StatusText, StatusFont,
-                new Rectangle(pad + 96, my - 5, cw - 96, StatusFont.Height + 3), StatusColor,
-                TextFormatFlags.Right | TextFormatFlags.NoPrefix);
+                new Rectangle(Pad + 100, my - 6, cw - 100, StatusFont.Height + 5), StatusColor,
+                TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+        }
+
+        // A rounded-rectangle path with corner radius rad.
+        static System.Drawing.Drawing2D.GraphicsPath Round(Rectangle r, int rad)
+        {
+            int d = rad * 2;
+            var p = new System.Drawing.Drawing2D.GraphicsPath();
+            if (d > r.Width) d = r.Width;
+            if (d > r.Height) d = r.Height;
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
         }
     }
 
@@ -816,22 +856,84 @@ namespace SteamGridDBFetcher
         public Panel Tile;
     }
 
+    // Owner-drawn button with antialiased rounded corners; accent buttons get a
+    // vertical purple gradient, secondary buttons a filled body with a border.
+    class RoundButton : Button
+    {
+        public bool Accent;
+        public Color Fill, FillHover, Line, GradTop, GradBot;
+        public int Radius = 9;
+        bool hover, down;
+
+        public RoundButton()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.UserPaint | ControlStyles.SupportsTransparentBackColor, true);
+            FlatStyle = FlatStyle.Flat;
+            FlatAppearance.BorderSize = 0;
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; down = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs e) { down = true; Invalidate(); base.OnMouseDown(e); }
+        protected override void OnMouseUp(MouseEventArgs e) { down = false; Invalidate(); base.OnMouseUp(e); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (var back = new SolidBrush(Parent != null ? Parent.BackColor : Fill))
+                g.FillRectangle(back, ClientRectangle);
+            var r = new Rectangle(0, 0, Width - 1, Height - 1);
+            int rad = Math.Min(Radius, Math.Min(r.Width, r.Height) / 2);
+            int d = rad * 2;
+            using (var p = new System.Drawing.Drawing2D.GraphicsPath())
+            {
+                p.AddArc(r.X, r.Y, d, d, 180, 90);
+                p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+                p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+                p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+                p.CloseFigure();
+                if (Accent)
+                {
+                    using (var lg = new System.Drawing.Drawing2D.LinearGradientBrush(
+                               new Rectangle(0, 0, Width, Height + 1), GradTop, GradBot, 90f))
+                        g.FillPath(lg, p);
+                    if (hover) using (var hl = new SolidBrush(Color.FromArgb(down ? 55 : 30, 255, 255, 255))) g.FillPath(hl, p);
+                }
+                else
+                {
+                    using (var b = new SolidBrush(down ? Line : (hover ? FillHover : Fill))) g.FillPath(b, p);
+                    using (var pen = new Pen(hover ? Line : Color.FromArgb(120, Line.R, Line.G, Line.B))) g.DrawPath(pen, p);
+                }
+            }
+            TextRenderer.DrawText(g, Text, Font, ClientRectangle, ForeColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
+                TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+        }
+    }
+
     class MainForm : Form
     {
-        // ---- palette (prototype "modern dark" tokens)
-        static readonly Color BG0 = ColorTranslator.FromHtml("#0b0d12");
-        static readonly Color BG1 = ColorTranslator.FromHtml("#10131b");
-        static readonly Color BG2 = ColorTranslator.FromHtml("#161a25");
-        static readonly Color BG3 = ColorTranslator.FromHtml("#1d2230");
-        static readonly Color FIELD = ColorTranslator.FromHtml("#0b0d12");
-        static readonly Color TX = ColorTranslator.FromHtml("#e8ecf4");
-        static readonly Color DIM = ColorTranslator.FromHtml("#8b93a5");
-        static readonly Color ACC = ColorTranslator.FromHtml("#4da3ff");
-        static readonly Color OKC = ColorTranslator.FromHtml("#3fb950");
-        static readonly Color WARN = ColorTranslator.FromHtml("#d4a24e");
-        static readonly Color ERRC = ColorTranslator.FromHtml("#e5534b");
-        static readonly Color NSFWB = ColorTranslator.FromHtml("#c0392f");   // adult-content tile border
-        static readonly Color METER_OFF = ColorTranslator.FromHtml("#2a3040");
+        // ---- palette (dark "gaming" tokens: deep near-black + neon purple) ----
+        static readonly Color BG0 = ColorTranslator.FromHtml("#0c0c16");   // window
+        static readonly Color BG1 = ColorTranslator.FromHtml("#14131f");   // bars / rail
+        static readonly Color BG2 = ColorTranslator.FromHtml("#1c1a2b");   // cards / tiles
+        static readonly Color BG3 = ColorTranslator.FromHtml("#26233a");   // hover / buttons
+        static readonly Color FIELD = ColorTranslator.FromHtml("#0a0912");  // inputs
+        static readonly Color LINE = ColorTranslator.FromHtml("#2e2a45");   // subtle borders
+        static readonly Color LINE2 = ColorTranslator.FromHtml("#3a3556");  // brighter borders
+        static readonly Color TX = ColorTranslator.FromHtml("#ecEAf4");
+        static readonly Color DIM = ColorTranslator.FromHtml("#9a93b0");
+        static readonly Color FAINT = ColorTranslator.FromHtml("#6f6a86");
+        static readonly Color ACC = ColorTranslator.FromHtml("#8b5cf6");    // neon purple
+        static readonly Color ACC2 = ColorTranslator.FromHtml("#a78bfa");   // lighter purple (hover/text)
+        static readonly Color ACCDIM = ColorTranslator.FromHtml("#6d5bc4"); // muted purple (borders/grad)
+        static readonly Color OKC = ColorTranslator.FromHtml("#4ade80");
+        static readonly Color WARN = ColorTranslator.FromHtml("#f5b14c");
+        static readonly Color ERRC = ColorTranslator.FromHtml("#f43f5e");
+        static readonly Color NSFWB = ColorTranslator.FromHtml("#b3243d");   // adult-content tile border
+        static readonly Color METER_OFF = ColorTranslator.FromHtml("#2e2a45");
 
         const int CoverW = 220, CoverH = 330;
 
@@ -1067,20 +1169,20 @@ namespace SteamGridDBFetcher
 
         Button MakeButton(string text, bool accent)
         {
-            var b = new Button
+            var b = new RoundButton
             {
                 Text = text,
-                FlatStyle = FlatStyle.Flat,
-                BackColor = accent ? ACC : BG3,
-                ForeColor = accent ? ColorTranslator.FromHtml("#06121f") : TX,
+                Accent = accent,
+                BackColor = BG1,
+                Fill = BG3, FillHover = ColorTranslator.FromHtml("#2d2947"), Line = LINE2,
+                GradTop = ACC2, GradBot = ACC,
+                ForeColor = accent ? ColorTranslator.FromHtml("#160b28") : TX,
                 Font = new Font("Segoe UI", 9f, FontStyle.Bold),
                 Cursor = Cursors.Hand,
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                Padding = new Padding(14, 7, 14, 7)
+                Padding = new Padding(15, 8, 15, 8)
             };
-            b.FlatAppearance.BorderSize = 0;
-            b.FlatAppearance.MouseOverBackColor = accent ? ColorTranslator.FromHtml("#6cb4ff") : ColorTranslator.FromHtml("#242b3d");
             return b;
         }
 
@@ -1139,7 +1241,7 @@ namespace SteamGridDBFetcher
             };
             toolbar.Controls.Add(brand);
 
-            scopeSeg = new Panel { Location = new Point(240, 15), Height = 36, BackColor = BG0, Width = 480 };
+            scopeSeg = new Panel { Location = new Point(240, 15), Height = 38, BackColor = BG2, Width = 480 };
             toolbar.Controls.Add(scopeSeg);
             for (int i = 0; i < scopeKeys.Length; i++)
             {
@@ -1147,13 +1249,13 @@ namespace SteamGridDBFetcher
                 var b = new Button
                 {
                     Text = scopeLabels[i], FlatStyle = FlatStyle.Flat, ForeColor = DIM,
-                    BackColor = BG0, Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+                    BackColor = BG2, Font = new Font("Segoe UI", 9f, FontStyle.Bold),
                     AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                    Padding = new Padding(10, 6, 10, 6), Cursor = Cursors.Hand,
-                    Location = new Point(3, 3), Tag = key
+                    Padding = new Padding(12, 6, 12, 6), Cursor = Cursors.Hand,
+                    Location = new Point(4, 4), Tag = key
                 };
                 b.FlatAppearance.BorderSize = 0;
-                b.FlatAppearance.MouseOverBackColor = BG2;
+                b.FlatAppearance.MouseOverBackColor = BG3;
                 b.Click += delegate
                 {
                     if (busy) return;
@@ -1257,12 +1359,21 @@ namespace SteamGridDBFetcher
             railFlow.Controls.Add(backBtn);
 
             var heroWrap = new Panel { Size = new Size(272, 280), BackColor = BG1, Margin = new Padding(0, 0, 0, 8) };
+            // thin purple frame behind the hero poster for a subtle glow
+            var heroFrame = new Panel
+            {
+                Location = new Point(42, 0), Size = new Size(188, 280), BackColor = ACCDIM
+            };
+            RoundControl(heroFrame, 14);
             heroPb = new PictureBox
             {
-                Location = new Point(44, 0), Size = new Size(184, 276),
+                Location = new Point(44, 2), Size = new Size(184, 276),
                 SizeMode = PictureBoxSizeMode.Zoom, BackColor = BG2
             };
+            RoundControl(heroPb, 12);
             heroWrap.Controls.Add(heroPb);
+            heroWrap.Controls.Add(heroFrame);
+            heroPb.BringToFront();
             railFlow.Controls.Add(heroWrap);
 
             dName = new Label
@@ -1326,6 +1437,7 @@ namespace SteamGridDBFetcher
                     Font = new Font("Segoe UI", 8.2f, FontStyle.Bold)
                 };
                 row.Controls.Add(dot); row.Controls.Add(nm); row.Controls.Add(st);
+                RoundControl(row, 10);
                 chkDot[t.Key] = dot;
                 chkStatus[t.Key] = st;
                 railFlow.Controls.Add(row);
@@ -1604,22 +1716,40 @@ namespace SteamGridDBFetcher
             counts[1] = shortcuts.Count(g => MissingCount(g) > 0);
             counts[2] = shortcuts.Count;
             counts[3] = steamGames.Count;
-            int x = 3, h = 30;
+            int x = 4, h = 30;
             for (int i = 0; i < scopeButtons.Count; i++)
             {
                 Button b = scopeButtons[i];
                 b.Text = scopeLabels[i] + "   " + counts[i];
                 bool on = (string)b.Tag == scope;
-                b.BackColor = on ? BG3 : BG0;
-                b.ForeColor = on ? TX : DIM;
-                b.Location = new Point(x, 3);
-                x += b.Width + 2;
+                b.BackColor = on ? ACC : BG2;
+                b.ForeColor = on ? ColorTranslator.FromHtml("#0b0912") : DIM;
+                b.Location = new Point(x, 4);
+                x += b.Width + 3;
                 if (b.Height > h) h = b.Height;
             }
-            scopeSeg.Width = x + 3;
-            scopeSeg.Height = h + 6;
+            scopeSeg.Width = x + 4;
+            scopeSeg.Height = h + 8;
+            RoundControl(scopeSeg, (h + 8) / 2);
+            foreach (Button b in scopeButtons) RoundControl(b, b.Height / 2);
             if (scopeSeg.Parent != null)
                 scopeSeg.Top = Math.Max(4, (scopeSeg.Parent.Height - scopeSeg.Height) / 2);
+        }
+
+        // Give a control antialiased-ish rounded corners by clipping its region.
+        static void RoundControl(Control c, int rad)
+        {
+            if (c.Width < 2 || c.Height < 2) return;
+            int d = Math.Max(2, Math.Min(rad, Math.Min(c.Width, c.Height) / 2)) * 2;
+            using (var p = new System.Drawing.Drawing2D.GraphicsPath())
+            {
+                p.AddArc(0, 0, d, d, 180, 90);
+                p.AddArc(c.Width - d, 0, d, d, 270, 90);
+                p.AddArc(c.Width - d, c.Height - d, d, d, 0, 90);
+                p.AddArc(0, c.Height - d, d, d, 90, 90);
+                p.CloseFigure();
+                c.Region = new Region(p);
+            }
         }
 
         bool ScopeMatch(Shortcut g)
@@ -1660,9 +1790,10 @@ namespace SteamGridDBFetcher
                 var card = new GameCard
                 {
                     Game = sc,
-                    Size = new Size(CoverW + 8, CoverH + 4 + GameCard.ExtraH),
-                    Margin = new Padding(7),
-                    BgNormal = BG0, BgHover = BG2, MeterOn = OKC, MeterOff = METER_OFF
+                    Size = new Size(CoverW + GameCard.Pad * 2, GameCard.Pad + CoverH + GameCard.BelowH),
+                    Margin = new Padding(6),
+                    BgNormal = BG2, BgHover = BG3, Border = LINE, BorderHover = ACCDIM,
+                    MeterOn = ACC, MeterOn2 = ACC2, MeterOff = METER_OFF
                 };
                 Shortcut captured = sc;
                 card.Click += delegate { if (!busy) OpenDetail(captured); };
@@ -1758,11 +1889,11 @@ namespace SteamGridDBFetcher
             {
                 using (var lg = new LinearGradientBrush(
                     new Rectangle(0, 0, CoverW, CoverH),
-                    ColorTranslator.FromHtml("#2b3446"), ColorTranslator.FromHtml("#151a26"), 65f))
+                    ColorTranslator.FromHtml("#2a2740"), ColorTranslator.FromHtml("#161422"), 65f))
                     g.FillRectangle(lg, 0, 0, CoverW, CoverH);
                 TextRenderer.DrawText(g, sc.Name, new Font("Segoe UI", 11f, FontStyle.Bold),
                     new Rectangle(14, 14, CoverW - 28, CoverH - 28),
-                    ColorTranslator.FromHtml("#aeb6c6"),
+                    ColorTranslator.FromHtml("#b0a9c8"),
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
                     TextFormatFlags.WordBreak);
             }
@@ -2255,6 +2386,7 @@ namespace SteamGridDBFetcher
                 Size = new Size(t.W + 10, t.H + 10), BackColor = BG2,
                 Margin = new Padding(4), Tag = null
             };
+            RoundControl(p, 12);
             var caption = new Label
             {
                 Text = existingPath != null ? "current"
@@ -2391,6 +2523,7 @@ namespace SteamGridDBFetcher
                 Size = new Size(t.W + 10, t.H + 10), BackColor = BG2,
                 Margin = new Padding(4), Tag = selUrl
             };
+            RoundControl(p, 12);
             var pb = new PictureBox
             {
                 Location = new Point(5, 5), Size = new Size(t.W, t.H - CapH),
@@ -2428,10 +2561,11 @@ namespace SteamGridDBFetcher
 
             var p = new Panel
             {
-                // adult-tagged assets get a red border, like on the SGDB site
+                // adult-tagged assets get a rose border, like on the SGDB site
                 Size = new Size(t.W + 10, t.H + 10), BackColor = a.Nsfw ? NSFWB : BG2,
                 Margin = new Padding(4), Tag = url
             };
+            RoundControl(p, 12);
             var pb = new PictureBox
             {
                 Location = new Point(5, 5), Size = new Size(t.W, hasCap ? t.H - CapH : t.H),
@@ -2470,6 +2604,7 @@ namespace SteamGridDBFetcher
                 Size = new Size(t.W + 10, t.H + 10), BackColor = BG3,
                 Margin = new Padding(4), Cursor = Cursors.Hand
             };
+            RoundControl(p, 12);
             var lbl = new Label
             {
                 Text = "Load more\n(" + remaining + " left)", ForeColor = ACC, BackColor = BG3,
