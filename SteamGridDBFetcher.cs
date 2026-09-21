@@ -832,6 +832,11 @@ namespace SteamGridDBFetcher
 
         protected override void OnResize(EventArgs e) { base.OnResize(e); Relayout(); }
 
+        // Repaint the whole viewport on scroll so no card (or its text) is left
+        // behind by the partial invalidation WinForms does when it blits a scroll.
+        protected override void OnScroll(ScrollEventArgs se) { base.OnScroll(se); Invalidate(); }
+        protected override void OnMouseWheel(MouseEventArgs e) { base.OnMouseWheel(e); Invalidate(); }
+
         Rectangle ContentRect(int i, int cols)
         {
             int c = i % cols, r = i / cols;
@@ -894,7 +899,10 @@ namespace SteamGridDBFetcher
             if (Items.Count == 0 || Provide == null) return;
 
             int cols = Cols();
-            g.TranslateTransform(AutoScrollPosition.X, AutoScrollPosition.Y);
+            // Draw at real client coordinates (card rect shifted by the scroll)
+            // rather than via TranslateTransform: TextRenderer.DrawText ignores the
+            // Graphics transform, so a transform would leave the card names/status
+            // drawn at un-scrolled positions and they'd vanish while scrolling.
             int scrollY = -AutoScrollPosition.Y;
             int top = scrollY, bottom = scrollY + ClientSize.Height;
             int firstRow = Math.Max(0, (top - PadY) / (CardH + Gap));
@@ -907,7 +915,9 @@ namespace SteamGridDBFetcher
                 {
                     int i = row * cols + col;
                     if (i >= Items.Count) break;
-                    DrawCard(g, ContentRect(i, cols), Items[i], Provide(Items[i]), i == hoverIdx);
+                    Rectangle rc = ContentRect(i, cols);
+                    rc.Offset(AutoScrollPosition.X, AutoScrollPosition.Y);   // content -> client
+                    DrawCard(g, rc, Items[i], Provide(Items[i]), i == hoverIdx);
                 }
             }
         }
@@ -1032,6 +1042,192 @@ namespace SteamGridDBFetcher
             TextRenderer.DrawText(g, Text, Font, ClientRectangle, ForeColor,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
                 TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+        }
+    }
+
+    // Owner-drawn checkbox: rounded box, purple gradient + white tick when on.
+    class ThemedCheckBox : CheckBox
+    {
+        public Color BoxOff, BoxOn, BoxOn2, CheckMark, Line, HoverLine, TextCol;
+        bool hover;
+        const int Box = 18, GapT = 8;
+
+        public ThemedCheckBox()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.SupportsTransparentBackColor, true);
+            Cursor = Cursors.Hand;
+            AutoSize = true;
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnCheckedChanged(EventArgs e) { Invalidate(); base.OnCheckedChanged(e); }
+
+        public override Size GetPreferredSize(Size proposed)
+        {
+            Size t = TextRenderer.MeasureText(Text, Font);
+            return new Size(Box + GapT + t.Width + 2, Math.Max(Box, t.Height) + 2);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (var back = new SolidBrush(Parent != null ? Parent.BackColor : BackColor))
+                g.FillRectangle(back, ClientRectangle);
+            int by = (Height - Box) / 2;
+            var box = new Rectangle(0, by, Box - 1, Box - 1);
+            using (var p = Round(box, 5))
+            {
+                if (Checked)
+                {
+                    using (var lg = new System.Drawing.Drawing2D.LinearGradientBrush(
+                               new Rectangle(box.X, box.Y, box.Width, box.Height + 1), BoxOn, BoxOn2, 90f))
+                        g.FillPath(lg, p);
+                    using (var pen = new Pen(CheckMark, 2f))
+                    {
+                        pen.StartCap = System.Drawing.Drawing2D.LineCap.Round;
+                        pen.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+                        pen.LineJoin = System.Drawing.Drawing2D.LineJoin.Round;
+                        g.DrawLines(pen, new PointF[]
+                        {
+                            new PointF(box.X + 4, box.Y + 9),
+                            new PointF(box.X + 7, box.Y + 13),
+                            new PointF(box.X + 14, box.Y + 4)
+                        });
+                    }
+                }
+                else
+                {
+                    using (var b = new SolidBrush(BoxOff)) g.FillPath(b, p);
+                    using (var pen = new Pen(hover ? HoverLine : Line, 1.4f)) g.DrawPath(pen, p);
+                }
+            }
+            TextRenderer.DrawText(g, Text, Font,
+                new Rectangle(Box + GapT, 0, Width - Box - GapT, Height), TextCol,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+        }
+
+        static System.Drawing.Drawing2D.GraphicsPath Round(Rectangle r, int rad)
+        {
+            int d = rad * 2;
+            var p = new System.Drawing.Drawing2D.GraphicsPath();
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+    }
+
+    // Themed dropdown: dark field, purple chevron, themed list items. Keeps the
+    // native ComboBox behaviour but paints over the system chrome.
+    class ThemedCombo : ComboBox
+    {
+        public Color Back, Fore, Line, Accent, SelBg, SelFg;
+
+        public ThemedCombo()
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList;
+            FlatStyle = FlatStyle.Flat;
+            DrawMode = DrawMode.OwnerDrawFixed;
+            ItemHeight = 22;
+        }
+
+        protected override void OnDrawItem(DrawItemEventArgs e)
+        {
+            if (e.Index < 0) return;
+            bool edit = (e.State & DrawItemState.ComboBoxEdit) != 0;
+            bool sel = !edit && (e.State & DrawItemState.Selected) != 0;
+            using (var b = new SolidBrush(sel ? SelBg : Back)) e.Graphics.FillRectangle(b, e.Bounds);
+            TextRenderer.DrawText(e.Graphics, GetItemText(Items[e.Index]), Font,
+                new Rectangle(e.Bounds.X + 8, e.Bounds.Y, e.Bounds.Width - 26, e.Bounds.Height),
+                sel ? SelFg : Fore,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == 0x0F && DropDownStyle == ComboBoxStyle.DropDownList)   // WM_PAINT
+            {
+                using (var g = Graphics.FromHwnd(Handle))
+                {
+                    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                    Rectangle r = ClientRectangle;
+                    int aw = 22;
+                    using (var b = new SolidBrush(Back))
+                        g.FillRectangle(b, r.Right - aw, r.Top, aw, r.Height);
+                    using (var pen = new Pen(Accent, 2f))
+                    {
+                        pen.StartCap = System.Drawing.Drawing2D.LineCap.Round;
+                        pen.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+                        pen.LineJoin = System.Drawing.Drawing2D.LineJoin.Round;
+                        int cx = r.Right - aw / 2 - 1, cy = r.Height / 2;
+                        g.DrawLines(pen, new Point[]
+                        {
+                            new Point(cx - 4, cy - 2), new Point(cx, cy + 3), new Point(cx + 4, cy - 2)
+                        });
+                    }
+                    using (var pen = new Pen(Line)) g.DrawRectangle(pen, r.X, r.Y, r.Width - 1, r.Height - 1);
+                }
+            }
+        }
+    }
+
+    // A rounded, themed container that hosts a borderless TextBox so text inputs
+    // match the rounded dropdowns/cards. The border turns purple on focus.
+    class ThemedInput : Panel
+    {
+        public TextBox Box;
+        public Color Field, Line, FocusLine;
+        bool focused;
+
+        public ThemedInput()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer, true);
+            Height = 36;
+            Box = new TextBox { BorderStyle = BorderStyle.None };
+            Box.GotFocus += delegate { focused = true; Invalidate(); };
+            Box.LostFocus += delegate { focused = false; Invalidate(); };
+            Cursor = Cursors.IBeam;
+            Click += delegate { Box.Focus(); };
+            Controls.Add(Box);
+        }
+
+        void Place()
+        {
+            if (Box == null) return;
+            Box.BackColor = Field;
+            Box.Location = new Point(12, (Height - Box.Height) / 2);
+            Box.Width = Width - 24;
+        }
+
+        protected override void OnResize(EventArgs e) { base.OnResize(e); Place(); }
+        protected override void OnCreateControl() { base.OnCreateControl(); Place(); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (var back = new SolidBrush(Parent != null ? Parent.BackColor : Field))
+                g.FillRectangle(back, ClientRectangle);
+            var r = new Rectangle(0, 0, Width - 1, Height - 1);
+            int rad = Math.Min(9, Height / 2);
+            int d = rad * 2;
+            using (var p = new System.Drawing.Drawing2D.GraphicsPath())
+            {
+                p.AddArc(r.X, r.Y, d, d, 180, 90);
+                p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+                p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+                p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+                p.CloseFigure();
+                using (var b = new SolidBrush(Field)) g.FillPath(b, p);
+                using (var pen = new Pen(focused ? FocusLine : Line, focused ? 1.5f : 1f)) g.DrawPath(pen, p);
+            }
         }
     }
 
@@ -1309,11 +1505,13 @@ namespace SteamGridDBFetcher
 
         CheckBox MakeCheck(string text)
         {
-            return new CheckBox
+            return new ThemedCheckBox
             {
-                Text = text, Checked = true, AutoSize = true,
-                ForeColor = TX, BackColor = BG1, Cursor = Cursors.Hand,
-                Margin = new Padding(0, 5, 14, 0)
+                Text = text, Checked = true,
+                BackColor = BG1, TextCol = TX,
+                BoxOff = FIELD, BoxOn = ACC2, BoxOn2 = ACC, CheckMark = ColorTranslator.FromHtml("#160b28"),
+                Line = LINE2, HoverLine = ACC2,
+                Margin = new Padding(0, 6, 16, 0)
             };
         }
 
@@ -1398,14 +1596,16 @@ namespace SteamGridDBFetcher
             };
             toolbar.Controls.Add(tools);
 
-            libSearch = new TextBox
+            var libSearchWrap = new ThemedInput
             {
-                Width = 220, BackColor = FIELD, ForeColor = TX,
-                BorderStyle = BorderStyle.FixedSingle, Font = new Font("Segoe UI", 10f),
-                Margin = new Padding(0, 5, 10, 0)
+                Width = 230, Height = 36, BackColor = BG1,
+                Field = FIELD, Line = LINE, FocusLine = ACC2, Margin = new Padding(0, 4, 10, 0)
             };
+            libSearch = libSearchWrap.Box;
+            libSearch.ForeColor = TX;
+            libSearch.Font = new Font("Segoe UI", 10f);
             libSearch.TextChanged += delegate { ApplyLibraryFilter(); };
-            tools.Controls.Add(libSearch);
+            tools.Controls.Add(libSearchWrap);
 
             refreshBtn = MakeButton("Refresh", false);
             refreshBtn.Margin = new Padding(0, 0, 10, 0);
@@ -1511,10 +1711,11 @@ namespace SteamGridDBFetcher
             railFlow.Controls.Add(dName);
 
             railFlow.Controls.Add(RailHeading("SteamGridDB match"));
-            matchCombo = new ComboBox
+            matchCombo = new ThemedCombo
             {
-                Width = 272, DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat,
-                BackColor = BG2, ForeColor = TX, Margin = new Padding(0)
+                Width = 272, BackColor = FIELD, ForeColor = TX, Margin = new Padding(0),
+                Font = new Font("Segoe UI", 10f),
+                Back = FIELD, Fore = TX, Line = LINE, Accent = ACC2, SelBg = ACC, SelFg = ColorTranslator.FromHtml("#160b28")
             };
             matchCombo.SelectedIndexChanged += delegate
             {
@@ -1525,17 +1726,19 @@ namespace SteamGridDBFetcher
             railFlow.Controls.Add(matchCombo);
 
             railFlow.Controls.Add(RailHeading("Search override"));
-            dSearch = new TextBox
+            var dSearchWrap = new ThemedInput
             {
-                Width = 272, BackColor = FIELD, ForeColor = TX,
-                BorderStyle = BorderStyle.FixedSingle, Font = new Font("Segoe UI", 10f),
-                Margin = new Padding(0)
+                Width = 272, Height = 36, BackColor = BG1,
+                Field = FIELD, Line = LINE, FocusLine = ACC2, Margin = new Padding(0)
             };
+            dSearch = dSearchWrap.Box;
+            dSearch.ForeColor = TX;
+            dSearch.Font = new Font("Segoe UI", 10f);
             dSearch.KeyDown += delegate(object s, KeyEventArgs e)
             {
                 if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; DoSearch(); }
             };
-            railFlow.Controls.Add(dSearch);
+            railFlow.Controls.Add(dSearchWrap);
 
             railFlow.Controls.Add(RailHeading("Artwork slots"));
             int rowH = Math.Max(32, Font.Height + 16);
