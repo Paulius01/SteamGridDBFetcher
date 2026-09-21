@@ -743,81 +743,204 @@ namespace SteamGridDBFetcher
         }
     }
 
-    // One owner-drawn control per library card (cover + name + slot meter +
-    // status) instead of five child controls - far fewer native windows, so
-    // creation and composited scrolling are much faster.
-    class GameCard : Control
+    // Per-card render data supplied by the form for whichever cards are visible.
+    class CardInfo
     {
-        public Shortcut Game;
-        public Image Cover;          // owned by MainForm caches, not by us
+        public Image Cover;          // owned by the form's caches, not by us
         public Image Placeholder;
-        public string StatusText = "";
+        public bool[] Slots;         // null = all filled (Steam defaults)
+        public string Status = "";
         public Color StatusColor;
         public Color NameColor;
-        public bool[] Slots;         // null = all filled (Steam defaults)
-        public Color BgNormal, BgHover, Border, BorderHover, MeterOn, MeterOn2, MeterOff;
-        bool hover;
+    }
 
+    // Virtualized poster grid: ONE control that owner-draws only the cards
+    // currently on screen, instead of one Control per game. A 500+ game library
+    // is then just a scroll offset + a few dozen DrawImage calls per frame, so it
+    // never bogs down or glitches no matter how large the library gets.
+    class LibraryGrid : Panel
+    {
+        [DllImport("user32.dll")]
+        static extern bool ShowScrollBar(IntPtr hWnd, int wBar, bool bShow);
+
+        public List<Shortcut> Items = new List<Shortcut>();
+        public int CoverW = 220, CoverH = 330;
+        public Color PageBg, BgNormal, BgHover, Border, BorderHover, MeterOn, MeterOn2, MeterOff;
+        public Func<Shortcut, CardInfo> Provide;   // per-card data (visible cards only)
+        public Action<Shortcut> Activate;          // click
+
+        const int Pad = 8, Gap = 12, PadX = 14, PadY = 12;
         static readonly Font NameFont = new Font("Segoe UI", 9f, FontStyle.Bold);
         static readonly Font StatusFont = new Font("Segoe UI", 7.6f);
+        int hoverIdx = -1;
 
-        public const int Pad = 8;
+        int CardW { get { return CoverW + Pad * 2; } }
+        int CardH { get { return Pad + CoverH + BelowH; } }
+        static int BelowH { get { return 8 + NameFont.Height + 2 + 7 + 6 + Pad; } }
 
-        // Height below the poster: gap + name row + gap + meter row + bottom pad.
-        public static int BelowH
-        {
-            get { return 8 + NameFont.Height + 2 + 7 + 6 + Pad; }
-        }
-
-        public GameCard()
+        public LibraryGrid()
         {
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
-                     ControlStyles.UserPaint, true);
-            Cursor = Cursors.Hand;
+                     ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+            AutoScroll = true;
+            DoubleBuffered = true;
         }
 
-        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
-        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override CreateParams CreateParams
+        {
+            get { CreateParams cp = base.CreateParams; cp.ExStyle |= 0x02000000; return cp; }  // WS_EX_COMPOSITED
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (IsHandleCreated &&
+                (m.Msg == 0x05 || m.Msg == 0x0F || m.Msg == 0x83 || m.Msg == 0x85 ||
+                 m.Msg == 0x114 || m.Msg == 0x115 || m.Msg == 0x20A))
+                ShowScrollBar(Handle, 3, false);   // keep the native scrollbars hidden
+            base.WndProc(ref m);
+        }
+
+        public void SetItems(List<Shortcut> items)
+        {
+            Items = items ?? new List<Shortcut>();
+            hoverIdx = -1;
+            AutoScrollPosition = new Point(0, 0);
+            Relayout();
+        }
+
+        // A cover/slot/status changed for one game - repaint just its card.
+        public void RefreshItem(uint appId)
+        {
+            for (int i = 0; i < Items.Count; i++)
+                if (Items[i].AppId == appId) { InvalidateCard(i); return; }
+        }
+
+        int Cols()
+        {
+            int avail = ClientSize.Width - PadX * 2;
+            return Math.Max(1, (avail + Gap) / (CardW + Gap));
+        }
+
+        void Relayout()
+        {
+            int cols = Cols();
+            int rows = (Items.Count + cols - 1) / cols;
+            int h = PadY * 2 + rows * CardH + Math.Max(0, rows - 1) * Gap;
+            AutoScrollMinSize = new Size(0, h);
+            Invalidate();
+        }
+
+        protected override void OnResize(EventArgs e) { base.OnResize(e); Relayout(); }
+
+        Rectangle ContentRect(int i, int cols)
+        {
+            int c = i % cols, r = i / cols;
+            return new Rectangle(PadX + c * (CardW + Gap), PadY + r * (CardH + Gap), CardW, CardH);
+        }
+
+        void InvalidateCard(int i)
+        {
+            Rectangle rc = ContentRect(i, Cols());
+            rc.Offset(AutoScrollPosition.X, AutoScrollPosition.Y);   // content -> client
+            rc.Inflate(2, 2);
+            Invalidate(rc);
+        }
+
+        int HitTest(Point pt)
+        {
+            int cols = Cols();
+            int cx = pt.X - PadX;
+            int cy = (pt.Y - AutoScrollPosition.Y) - PadY;   // client -> content
+            if (cx < 0 || cy < 0) return -1;
+            int col = cx / (CardW + Gap);
+            if (col >= cols || cx - col * (CardW + Gap) > CardW) return -1;
+            int row = cy / (CardH + Gap);
+            if (cy - row * (CardH + Gap) > CardH) return -1;
+            int i = row * cols + col;
+            return (i >= 0 && i < Items.Count) ? i : -1;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            int i = HitTest(e.Location);
+            if (i != hoverIdx)
+            {
+                int old = hoverIdx; hoverIdx = i;
+                if (old >= 0) InvalidateCard(old);
+                if (i >= 0) InvalidateCard(i);
+                Cursor = i >= 0 ? Cursors.Hand : Cursors.Default;
+            }
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (hoverIdx >= 0) { int old = hoverIdx; hoverIdx = -1; InvalidateCard(old); }
+        }
+
+        protected override void OnMouseClick(MouseEventArgs e)
+        {
+            base.OnMouseClick(e);
+            if (e.Button != MouseButtons.Left) return;
+            int i = HitTest(e.Location);
+            if (i >= 0 && Activate != null) Activate(Items[i]);
+        }
 
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
-            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-            // paint the window backdrop first so the rounded corners read as round
-            using (var back = new SolidBrush(Parent != null ? Parent.BackColor : BgNormal))
-                g.FillRectangle(back, ClientRectangle);
+            using (var bg = new SolidBrush(PageBg)) g.FillRectangle(bg, e.ClipRectangle);
+            if (Items.Count == 0 || Provide == null) return;
 
-            // rounded card body + border (border brightens to accent on hover)
-            var card = new Rectangle(1, 1, Width - 3, Height - 3);
+            int cols = Cols();
+            g.TranslateTransform(AutoScrollPosition.X, AutoScrollPosition.Y);
+            int scrollY = -AutoScrollPosition.Y;
+            int top = scrollY, bottom = scrollY + ClientSize.Height;
+            int firstRow = Math.Max(0, (top - PadY) / (CardH + Gap));
+            int lastRow = (bottom - PadY) / (CardH + Gap);
+
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            for (int row = firstRow; row <= lastRow; row++)
+            {
+                for (int col = 0; col < cols; col++)
+                {
+                    int i = row * cols + col;
+                    if (i >= Items.Count) break;
+                    DrawCard(g, ContentRect(i, cols), Items[i], Provide(Items[i]), i == hoverIdx);
+                }
+            }
+        }
+
+        void DrawCard(Graphics g, Rectangle rect, Shortcut game, CardInfo info, bool hover)
+        {
+            var card = new Rectangle(rect.X + 1, rect.Y + 1, rect.Width - 3, rect.Height - 3);
             using (var path = Round(card, 14))
             {
                 using (var bg = new SolidBrush(hover ? BgHover : BgNormal)) g.FillPath(bg, path);
                 using (var pen = new Pen(hover ? BorderHover : Border, hover ? 1.5f : 1f)) g.DrawPath(pen, path);
             }
 
-            int cw = Width - Pad * 2;
-            int ch = cw * 3 / 2;
-            var poster = new Rectangle(Pad, Pad, cw, ch);
+            var poster = new Rectangle(rect.X + Pad, rect.Y + Pad, CoverW, CoverH);
             using (var pp = Round(poster, 9))
             {
                 g.SetClip(pp, System.Drawing.Drawing2D.CombineMode.Replace);
-                Image img = Cover != null ? Cover : Placeholder;
+                Image img = info.Cover != null ? info.Cover : info.Placeholder;
                 if (img != null) { try { g.DrawImage(img, poster); } catch (Exception) { } }
                 else using (var pb = new SolidBrush(MeterOff)) g.FillRectangle(pb, poster);
+                g.ResetClip();
             }
-            g.ResetClip();
 
-            int y = Pad + ch + 8;
+            int y = rect.Y + Pad + CoverH + 8;
             int nameH = NameFont.Height + 2;
-            TextRenderer.DrawText(g, Game != null ? Game.Name : "", NameFont,
-                new Rectangle(Pad, y, cw, nameH), NameColor,
+            TextRenderer.DrawText(g, game != null ? game.Name : "", NameFont,
+                new Rectangle(rect.X + Pad, y, CoverW, nameH), info.NameColor,
                 TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
             int my = y + nameH + 7;
             for (int i = 0; i < 4; i++)
             {
-                bool on = Slots == null || (i < Slots.Length && Slots[i]);
-                var r = new Rectangle(Pad + i * 24, my, 20, 5);
+                bool on = info.Slots == null || (i < info.Slots.Length && info.Slots[i]);
+                var r = new Rectangle(rect.X + Pad + i * 24, my, 20, 5);
                 using (var bp = Round(r, 2))
                 {
                     if (on)
@@ -828,12 +951,11 @@ namespace SteamGridDBFetcher
                         using (var b = new SolidBrush(MeterOff)) g.FillPath(b, bp);
                 }
             }
-            TextRenderer.DrawText(g, StatusText, StatusFont,
-                new Rectangle(Pad + 100, my - 6, cw - 100, StatusFont.Height + 5), StatusColor,
+            TextRenderer.DrawText(g, info.Status, StatusFont,
+                new Rectangle(rect.X + Pad + 100, my - 6, CoverW - 100, StatusFont.Height + 5), info.StatusColor,
                 TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
         }
 
-        // A rounded-rectangle path with corner radius rad.
         static System.Drawing.Drawing2D.GraphicsPath Round(Rectangle r, int rad)
         {
             int d = rad * 2;
@@ -954,7 +1076,7 @@ namespace SteamGridDBFetcher
 
         // ---- library view
         Panel libraryView;
-        FlowLayoutPanel libraryFlow;
+        LibraryGrid libGrid;
         Panel scopeSeg;
         readonly List<Button> scopeButtons = new List<Button>();
         readonly string[] scopeKeys = new string[] { "all", "missing", "nonsteam", "steam" };
@@ -966,7 +1088,6 @@ namespace SteamGridDBFetcher
         Label batchLabel, batchTxt;
         Panel batchBarOuter, batchBarInner;
         System.Windows.Forms.Timer stripHideTimer;
-        readonly Dictionary<uint, GameCard> gameTiles = new Dictionary<uint, GameCard>();
         readonly Dictionary<uint, Image> coverImages = new Dictionary<uint, Image>();
         readonly Dictionary<uint, Image> placeholders = new Dictionary<uint, Image>();
         readonly Dictionary<uint, Image> steamCoverCache = new Dictionary<uint, Image>();
@@ -1326,13 +1447,17 @@ namespace SteamGridDBFetcher
             stripHideTimer = new System.Windows.Forms.Timer { Interval = 3500 };
             stripHideTimer.Tick += delegate { stripHideTimer.Stop(); batchStrip.Visible = false; };
 
-            libraryFlow = new BareFlowPanel
+            libGrid = new LibraryGrid
             {
-                Dock = DockStyle.Fill, AutoScroll = true, BackColor = BG0,
-                Padding = new Padding(14, 12, 14, 12)
+                Dock = DockStyle.Fill, BackColor = BG0,
+                CoverW = CoverW, CoverH = CoverH,
+                PageBg = BG0, BgNormal = BG2, BgHover = BG3, Border = LINE, BorderHover = ACCDIM,
+                MeterOn = ACC, MeterOn2 = ACC2, MeterOff = METER_OFF
             };
-            libraryView.Controls.Add(libraryFlow);
-            libraryFlow.BringToFront();
+            libGrid.Provide = BuildCardInfo;
+            libGrid.Activate = delegate(Shortcut sc) { if (!busy) OpenDetail(sc); };
+            libraryView.Controls.Add(libGrid);
+            libGrid.BringToFront();
 
             // ============================================= DETAIL VIEW
             detailView = new Panel { Dock = DockStyle.Fill, BackColor = BG0, Visible = false };
@@ -1638,10 +1763,6 @@ namespace SteamGridDBFetcher
             gridDir = Artwork.GridDir(steamPath, userId);
 
             slotState.Clear();
-            var old = libraryFlow.Controls.Cast<Control>().ToList();
-            libraryFlow.Controls.Clear();
-            foreach (Control c in old) c.Dispose();
-            gameTiles.Clear();
             foreach (Image img in coverImages.Values) img.Dispose();
             coverImages.Clear();
             foreach (Image img in placeholders.Values) img.Dispose();
@@ -1652,9 +1773,8 @@ namespace SteamGridDBFetcher
                 GetSlots(sc.AppId);
                 if (sc.IsSteam) QueueSteamCover(sc);
             }
-            BuildLibrary();
             RenderScopeSeg();
-            ApplyLibraryFilter();
+            ApplyLibraryFilter();   // populates the grid with the filtered list
 
             // decode custom covers off the UI thread; cards pop in as ready
             int g = libGen;
@@ -1688,7 +1808,7 @@ namespace SteamGridDBFetcher
                             Image prev;
                             if (coverImages.TryGetValue(cur.AppId, out prev) && prev != null) prev.Dispose();
                             coverImages[cur.AppId] = bmp;
-                            UpdateTile(cur);
+                            libGrid.RefreshItem(cur.AppId);
                         });
                     }
                     catch (Exception) { bmp.Dispose(); return; }   // window closed
@@ -1770,67 +1890,36 @@ namespace SteamGridDBFetcher
         void ApplyLibraryFilter()
         {
             if (shortcuts == null) return;
-            string q = libSearch.Text.Trim();
-            libraryFlow.SuspendLayout();
-            foreach (Shortcut g in AllGames)
-            {
-                GameCard t;
-                if (gameTiles.TryGetValue(g.AppId, out t))
-                    t.Visible = ScopeMatch(g) &&
-                        (q.Length == 0 || g.Name.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0);
-            }
-            libraryFlow.ResumeLayout();
+            libGrid.SetItems(VisibleGames().ToList());
         }
 
-        void BuildLibrary()
+        // Per-card render data, pulled by the grid only for cards it's about to
+        // paint - so covers/placeholders are built lazily for what's on screen.
+        CardInfo BuildCardInfo(Shortcut sc)
         {
-            libraryFlow.SuspendLayout();
-            foreach (Shortcut sc in AllGames)
-            {
-                var card = new GameCard
-                {
-                    Game = sc,
-                    Size = new Size(CoverW + GameCard.Pad * 2, GameCard.Pad + CoverH + GameCard.BelowH),
-                    Margin = new Padding(6),
-                    BgNormal = BG2, BgHover = BG3, Border = LINE, BorderHover = ACCDIM,
-                    MeterOn = ACC, MeterOn2 = ACC2, MeterOff = METER_OFF
-                };
-                Shortcut captured = sc;
-                card.Click += delegate { if (!busy) OpenDetail(captured); };
-                gameTiles[sc.AppId] = card;
-                libraryFlow.Controls.Add(card);
-                UpdateTile(sc);
-            }
-            libraryFlow.ResumeLayout();
-        }
-
-        void UpdateTile(Shortcut sc)
-        {
-            GameCard t;
-            if (!gameTiles.TryGetValue(sc.AppId, out t)) return;
+            var ci = new CardInfo();
             Image cover;
             if (!coverImages.TryGetValue(sc.AppId, out cover) && sc.IsSteam)
                 steamCoverCache.TryGetValue(sc.AppId, out cover);
-            t.Cover = cover;
-            t.Placeholder = cover == null ? GetPlaceholder(sc) : null;
-            t.Slots = sc.IsSteam ? null : GetSlots(sc.AppId);
+            ci.Cover = cover;
+            ci.Placeholder = cover == null ? GetPlaceholder(sc) : null;
+            ci.Slots = sc.IsSteam ? null : GetSlots(sc.AppId);
             bool isApplied = applied.Contains(sc.AppId);
-            t.NameColor = isApplied ? OKC : TX;
+            ci.NameColor = isApplied ? OKC : TX;
             int missing = MissingCount(sc);
-            if (isApplied) { t.StatusText = "updated"; t.StatusColor = OKC; }
-            else if (sc.IsSteam) { t.StatusText = "Steam"; t.StatusColor = DIM; }
-            else if (missing == 4) { t.StatusText = "no artwork"; t.StatusColor = WARN; }
-            else if (missing > 0) { t.StatusText = missing + (missing > 1 ? " slots empty" : " slot empty"); t.StatusColor = WARN; }
-            else { t.StatusText = "complete"; t.StatusColor = DIM; }
-            t.Invalidate();
+            if (isApplied) { ci.Status = "updated"; ci.StatusColor = OKC; }
+            else if (sc.IsSteam) { ci.Status = "Steam"; ci.StatusColor = DIM; }
+            else if (missing == 4) { ci.Status = "no artwork"; ci.StatusColor = WARN; }
+            else if (missing > 0) { ci.Status = missing + (missing > 1 ? " slots empty" : " slot empty"); ci.StatusColor = WARN; }
+            else { ci.Status = "complete"; ci.StatusColor = DIM; }
+            return ci;
         }
 
         void RefreshGame(uint appid)
         {
             slotState[appid] = ComputeSlots(appid);
             LoadCoverImage(appid);
-            Shortcut sc = AllGames.FirstOrDefault(x => x.AppId == appid);
-            if (sc != null) UpdateTile(sc);
+            libGrid.RefreshItem(appid);
             RenderScopeSeg();
         }
 
@@ -1976,8 +2065,7 @@ namespace SteamGridDBFetcher
                         if (steamCoverCache.ContainsKey(appid)) { bmp.Dispose(); return; }
                         steamCoverCache[appid] = bmp;
                         if (g != libGen) return;
-                        Shortcut cur = AllGames.FirstOrDefault(x => x.AppId == appid);
-                        if (cur != null) UpdateTile(cur);
+                        libGrid.RefreshItem(appid);
                     });
                 }
                 catch (Exception) { bmp.Dispose(); }   // window closed
