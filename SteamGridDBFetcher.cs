@@ -227,47 +227,89 @@ namespace SteamGridDBFetcher
             return Crc32(Encoding.UTF8.GetBytes(exe + name)) | 0x80000000u;
         }
 
+        // Picks the Steam profile to work on and returns its shortcuts (possibly
+        // none - a library of only Steam games is fine). Profile order: the
+        // "user_id" config override, then the account currently/most recently
+        // logged in, then the profile with the most shortcuts.
         public static List<Shortcut> LoadShortcuts(string steamPath, string userOverride, out string userId)
         {
-            var candidates = new List<KeyValuePair<string, List<Shortcut>>>();
             string userdata = Path.Combine(steamPath, "userdata");
+            var ids = new List<string>();
             if (Directory.Exists(userdata))
-            {
                 foreach (string dir in Directory.GetDirectories(userdata))
                 {
-                    string vdf = Path.Combine(dir, "config", "shortcuts.vdf");
-                    if (!File.Exists(vdf)) continue;
-                    Dictionary<string, object> root;
-                    try { root = ParseVdf(File.ReadAllBytes(vdf)); }
-                    catch (Exception) { continue; }
-
-                    var list = new List<Shortcut>();
-                    foreach (var kv in root.OrderBy(SortKey))
-                    {
-                        var e = kv.Value as Dictionary<string, object>;
-                        if (e == null) continue;
-                        object nv;
-                        string name = e.TryGetValue("appname", out nv) && nv is string ? ((string)nv).Trim() : "";
-                        if (name.Length == 0) continue;
-                        list.Add(new Shortcut { AppId = ShortcutAppId(e), Name = name });
-                    }
-                    candidates.Add(new KeyValuePair<string, List<Shortcut>>(Path.GetFileName(dir), list));
+                    string n = Path.GetFileName(dir);
+                    if (n != "0" && n.Length > 0 && n.All(c => char.IsDigit(c))) ids.Add(n);
                 }
-            }
+            if (ids.Count == 0)
+                throw new Exception("No Steam user profile found. Log in to Steam at least once, then try again.");
 
-            if (candidates.Count == 0)
-                throw new Exception("No non-Steam shortcuts found in any Steam profile.");
-
+            string pick = null;
             if (!string.IsNullOrEmpty(userOverride))
             {
-                foreach (var c in candidates)
-                    if (c.Key == userOverride) { userId = c.Key; return c.Value; }
-                throw new Exception("Steam profile " + userOverride + " has no shortcuts.vdf.");
+                if (!ids.Contains(userOverride))
+                    throw new Exception("Steam profile " + userOverride + " (user_id in config.json) doesn't exist.");
+                pick = userOverride;
             }
+            if (pick == null)
+            {
+                string active = ActiveAccountId(steamPath);
+                if (active != null && ids.Contains(active)) pick = active;
+            }
+            if (pick == null)
+                pick = ids.OrderByDescending(id => ReadShortcuts(userdata, id).Count).First();
 
-            var best = candidates.OrderByDescending(c => c.Value.Count).First();
-            userId = best.Key;
-            return best.Value;
+            userId = pick;
+            return ReadShortcuts(userdata, pick);
+        }
+
+        static List<Shortcut> ReadShortcuts(string userdata, string id)
+        {
+            var list = new List<Shortcut>();
+            string vdf = Path.Combine(userdata, id, "config", "shortcuts.vdf");
+            if (!File.Exists(vdf)) return list;
+            Dictionary<string, object> root;
+            try { root = ParseVdf(File.ReadAllBytes(vdf)); }
+            catch (Exception) { return list; }
+            foreach (var kv in root.OrderBy(SortKey))
+            {
+                var e = kv.Value as Dictionary<string, object>;
+                if (e == null) continue;
+                object nv;
+                string name = e.TryGetValue("appname", out nv) && nv is string ? ((string)nv).Trim() : "";
+                if (name.Length == 0) continue;
+                list.Add(new Shortcut { AppId = ShortcutAppId(e), Name = name });
+            }
+            return list;
+        }
+
+        // The userdata folder name (32-bit account id) of the logged-in account:
+        // Steam's ActiveUser registry value while it runs, otherwise the
+        // "MostRecent" entry in config\loginusers.vdf.
+        static string ActiveAccountId(string steamPath)
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam\ActiveProcess"))
+                {
+                    if (k != null)
+                    {
+                        object v = k.GetValue("ActiveUser");
+                        if (v != null && Convert.ToInt64(v) > 0) return Convert.ToInt64(v).ToString();
+                    }
+                }
+            }
+            catch (Exception) { }
+            try
+            {
+                string lu = Path.Combine(steamPath, "config", "loginusers.vdf");
+                if (File.Exists(lu))
+                    foreach (Match m in Regex.Matches(File.ReadAllText(lu), "\"(\\d{17})\"\\s*\\{([^}]*)\\}"))
+                        if (Regex.IsMatch(m.Groups[2].Value, "\"MostRecent\"\\s*\"1\"", RegexOptions.IgnoreCase))
+                            return (ulong.Parse(m.Groups[1].Value) - 76561197960265728UL).ToString();
+            }
+            catch (Exception) { }
+            return null;
         }
 
         static int SortKey(KeyValuePair<string, object> kv)
@@ -651,28 +693,39 @@ namespace SteamGridDBFetcher
             return ext == ".webp" ? ".png" : ext;
         }
 
-        // Download one asset and write it as the correct grid file.
-        // Any replaced files are backed up to backups\<stamp>\ first.
+        // Download one asset and write it as the correct grid file. The new file
+        // is fully written to a temp file first, so a failed download/write never
+        // leaves the slot empty. Replaced files are backed up to
+        // backups\<stamp>\ (one folder per apply operation) before the swap.
         public static async Task<ApplyResult> Apply(string gdir, uint appid, AType t, string url, string stamp)
         {
             byte[] data = await Sgdb.Download(url);
             string target = Path.Combine(gdir, appid + t.Suffix + GridExt(url));
+            string tmp = target + ".sgdbtmp";
+            File.WriteAllBytes(tmp, data);
             var res = new ApplyResult { NewPath = target, Name = Path.GetFileName(target) };
-
-            string bdir = Path.Combine(Cfg.BackupRoot, stamp);
-            foreach (string ext in Cfg.ImageExts)
+            try
             {
-                string old = Path.Combine(gdir, appid + t.Suffix + ext);
-                if (File.Exists(old))
+                string bdir = Path.Combine(Cfg.BackupRoot, stamp);
+                foreach (string ext in Cfg.ImageExts)
                 {
-                    Directory.CreateDirectory(bdir);
-                    string bak = Path.Combine(bdir, Path.GetFileName(old));
-                    if (!File.Exists(bak)) File.Copy(old, bak);
-                    res.BackupPaths.Add(bak);
-                    File.Delete(old);
+                    string old = Path.Combine(gdir, appid + t.Suffix + ext);
+                    if (File.Exists(old))
+                    {
+                        Directory.CreateDirectory(bdir);
+                        string bak = Path.Combine(bdir, Path.GetFileName(old));
+                        if (!File.Exists(bak)) File.Copy(old, bak);
+                        res.BackupPaths.Add(bak);
+                        File.Delete(old);
+                    }
                 }
+                File.Move(tmp, target);
             }
-            File.WriteAllBytes(target, data);
+            catch (Exception)
+            {
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch (Exception) { }
+                throw;
+            }
             return res;
         }
     }
@@ -1257,7 +1310,16 @@ namespace SteamGridDBFetcher
 
         Dictionary<string, object> cfg;
         Sgdb api;
-        string steamPath, userId, gridDir, stamp;
+        string steamPath, userId, gridDir;
+        int opCounter;
+
+        // A fresh backup folder name per apply operation, so every apply (even
+        // of the same slot twice in a session) keeps its own "before" copy and
+        // undo restores exactly the previous state.
+        string NewBackupStamp()
+        {
+            return DateTime.Now.ToString("yyyyMMdd-HHmmss") + "-" + (++opCounter).ToString("D3");
+        }
         List<Shortcut> shortcuts;
         List<Shortcut> steamGames = new List<Shortcut>();
 
@@ -1293,7 +1355,6 @@ namespace SteamGridDBFetcher
         Panel detailView;
         Button backBtn, applyBtn, autoFillBtn;
         PictureBox heroPb;
-        Image heroOwned;                 // hero image loaded from disk (we own it)
         Label dName, stagedLabel, railStatus;
         LinkLabel undoLink;
         ComboBox matchCombo;
@@ -1411,7 +1472,6 @@ namespace SteamGridDBFetcher
                 api = new Sgdb(key.Trim());
 
                 steamPath = Steam.FindPath(cfg);
-                stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
 
                 // restore persisted scope + filters
                 scope = Cfg.Str(cfg, "scope") ?? "all";
@@ -1920,13 +1980,39 @@ namespace SteamGridDBFetcher
 
         // ------------------------------------------------- slot state helpers
 
+        // In-memory listing of the grid folder. Checking 4 slots x 4 extensions
+        // per game with File.Exists meant thousands of disk hits on the UI thread
+        // for a big library; one directory listing + set lookups is near-instant.
+        // Rebuilt on (re)load; single games are re-checked after we write to them.
+        readonly HashSet<string> gridFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void IndexGridDir()
+        {
+            gridFiles.Clear();
+            if (gridDir == null) return;
+            try { foreach (string f in Directory.GetFiles(gridDir)) gridFiles.Add(Path.GetFileName(f)); }
+            catch (Exception) { }
+        }
+
+        void ReindexGame(uint appid)
+        {
+            if (gridDir == null) return;
+            foreach (AType t in Cfg.Types)
+                foreach (string ext in Cfg.ImageExts)
+                {
+                    string name = appid + t.Suffix + ext;
+                    if (File.Exists(Path.Combine(gridDir, name))) gridFiles.Add(name);
+                    else gridFiles.Remove(name);
+                }
+        }
+
         string FindExisting(uint appid, string suffix)
         {
             if (gridDir == null) return null;
             foreach (string ext in Cfg.ImageExts)
             {
-                string p = Path.Combine(gridDir, appid + suffix + ext);
-                if (File.Exists(p)) return p;
+                string name = appid + suffix + ext;
+                if (gridFiles.Contains(name)) return Path.Combine(gridDir, name);
             }
             return null;
         }
@@ -1964,6 +2050,7 @@ namespace SteamGridDBFetcher
             shortcuts = Steam.LoadShortcuts(steamPath, Cfg.Str(cfg, "user_id"), out userId);
             steamGames = Steam.LoadSteamGames(steamPath);
             gridDir = Artwork.GridDir(steamPath, userId);
+            IndexGridDir();
 
             slotState.Clear();
             foreach (Image img in coverImages.Values) img.Dispose();
@@ -1979,37 +2066,31 @@ namespace SteamGridDBFetcher
             RenderScopeSeg();
             ApplyLibraryFilter();   // populates the grid with the filtered list
 
-            // decode custom covers off the UI thread; cards pop in as ready
+            // decode custom covers off the UI thread; cards pop in as ready.
+            // Paths are resolved here (UI thread) so the worker never reads the
+            // grid index while the UI might be updating it.
             int g = libGen;
-            var snapshot = AllGames.ToList();
+            var snapshot = new List<KeyValuePair<Shortcut, string>>();
+            foreach (Shortcut sc in AllGames)
+            {
+                string cp = FindExisting(sc.AppId, "p");
+                if (cp != null) snapshot.Add(new KeyValuePair<Shortcut, string>(sc, cp));
+            }
             ThreadPool.QueueUserWorkItem(delegate
             {
-                foreach (Shortcut sc in snapshot)
+                foreach (var entry in snapshot)
                 {
                     if (g != libGen) return;
-                    string p = FindExisting(sc.AppId, "p");
-                    if (p == null) continue;
-                    Bitmap bmp = null;
-                    try
-                    {
-                        byte[] cbytes = File.ReadAllBytes(p);
-                        Image src;
-                        // animated covers are webp bytes in a .png file (GDI+ can't
-                        // read webp) - fall back to the WIC decoder
-                        try { src = Image.FromStream(new MemoryStream(cbytes)); }
-                        catch (Exception) { src = WicDecode(cbytes); }
-                        if (src == null) continue;
-                        using (src) bmp = ScaleCover(src);
-                    }
-                    catch (Exception) { continue; }
-                    Shortcut cur = sc;
+                    Bitmap bmp = DecodeCoverFile(entry.Value);
+                    if (bmp == null) continue;
+                    Shortcut cur = entry.Key;
                     try
                     {
                         BeginInvoke((MethodInvoker)delegate
                         {
-                            if (g != libGen) { bmp.Dispose(); return; }
-                            Image prev;
-                            if (coverImages.TryGetValue(cur.AppId, out prev) && prev != null) prev.Dispose();
+                            // already loaded (e.g. by the hero preview)? keep that
+                            // one - it may be on screen - and drop this copy
+                            if (g != libGen || coverImages.ContainsKey(cur.AppId)) { bmp.Dispose(); return; }
                             coverImages[cur.AppId] = bmp;
                             libGrid.RefreshItem(cur.AppId);
                         });
@@ -2120,6 +2201,7 @@ namespace SteamGridDBFetcher
 
         void RefreshGame(uint appid)
         {
+            ReindexGame(appid);
             slotState[appid] = ComputeSlots(appid);
             LoadCoverImage(appid);
             libGrid.RefreshItem(appid);
@@ -2158,18 +2240,8 @@ namespace SteamGridDBFetcher
             coverImages.Remove(appid);
             string p = FindExisting(appid, "p");
             if (p == null) return;
-            try
-            {
-                byte[] bytes = File.ReadAllBytes(p);   // read bytes so the file isn't locked
-                Image src;
-                // an applied animated cover is webp bytes in a .png file; GDI+
-                // can't read webp, so fall back to the WIC decoder
-                try { src = Image.FromStream(new MemoryStream(bytes)); }
-                catch (Exception) { src = WicDecode(bytes); }
-                if (src != null)
-                    using (src) coverImages[appid] = ScaleCover(src);
-            }
-            catch (Exception) { }
+            Bitmap bmp = DecodeCoverFile(p);
+            if (bmp != null) coverImages[appid] = bmp;
         }
 
         Image GetPlaceholder(Shortcut sc)
@@ -2193,89 +2265,153 @@ namespace SteamGridDBFetcher
             return bmp;
         }
 
-        // Fetch a Steam-store game's own library cover: local Steam cache
-        // first (exactly what Steam shows, offline), then both CDNs.
+        // Steam-store games' own library covers: local Steam cache first (exactly
+        // what Steam shows, offline), then both CDNs. Loaded by a small fixed pool
+        // of workers - queuing one thread-pool job per game flooded the pool on
+        // big libraries and starved the app's other background work.
+        readonly System.Collections.Concurrent.ConcurrentQueue<uint> steamCoverQueue =
+            new System.Collections.Concurrent.ConcurrentQueue<uint>();
+        readonly HashSet<uint> steamCoverPending = new HashSet<uint>();   // UI thread only
+        int steamCoverWorkers;
+        const int SteamCoverWorkerMax = 4;
+
         void QueueSteamCover(Shortcut sc)
         {
-            if (steamCoverCache.ContainsKey(sc.AppId)) return;
-            int g = libGen;
-            uint appid = sc.AppId;
-            ThreadPool.QueueUserWorkItem(delegate
-            {
-                Bitmap bmp = null;
-                try
-                {
-                    byte[] data = null;
-                    string cache = Path.Combine(steamPath, "appcache", "librarycache");
-                    var local = new List<string>
-                    {
-                        Path.Combine(cache, appid + "_library_600x900.jpg"),
-                        Path.Combine(cache, appid.ToString(), "library_600x900.jpg"),
-                    };
-                    foreach (string lc in local)
-                        if (File.Exists(lc))
-                        {
-                            try { data = File.ReadAllBytes(lc); break; }
-                            catch (Exception) { }
-                        }
+            if (steamCoverCache.ContainsKey(sc.AppId) || !steamCoverPending.Add(sc.AppId)) return;
+            steamCoverQueue.Enqueue(sc.AppId);
+            EnsureSteamCoverWorker();
+        }
 
-                    // hash-subfolder layout: {appid}/{hash}/library_600x900.jpg
-                    if (data == null)
+        // Start one more worker if there's queued work and we're under the cap.
+        void EnsureSteamCoverWorker()
+        {
+            while (!steamCoverQueue.IsEmpty)
+            {
+                int w = steamCoverWorkers;
+                if (w >= SteamCoverWorkerMax) return;
+                if (Interlocked.CompareExchange(ref steamCoverWorkers, w + 1, w) == w)
+                {
+                    Task.Run(() => SteamCoverWorker());
+                    return;
+                }
+            }
+        }
+
+        void SteamCoverWorker()
+        {
+            try
+            {
+                uint next;
+                while (steamCoverQueue.TryDequeue(out next))
+                {
+                    uint id = next;
+                    Bitmap bmp = LoadSteamCover(id);
+                    try
+                    {
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            steamCoverPending.Remove(id);
+                            if (bmp == null) return;
+                            if (steamCoverCache.ContainsKey(id)) { bmp.Dispose(); return; }
+                            steamCoverCache[id] = bmp;
+                            libGrid.RefreshItem(id);
+                        });
+                    }
+                    catch (Exception) { if (bmp != null) bmp.Dispose(); return; }   // window closed
+                }
+            }
+            finally { Interlocked.Decrement(ref steamCoverWorkers); }
+            if (!steamCoverQueue.IsEmpty) EnsureSteamCoverWorker();   // raced with a new enqueue
+        }
+
+        Bitmap LoadSteamCover(uint appid)
+        {
+            try
+            {
+                byte[] data = null;
+                string cache = Path.Combine(steamPath, "appcache", "librarycache");
+                var local = new List<string>
+                {
+                    Path.Combine(cache, appid + "_library_600x900.jpg"),
+                    Path.Combine(cache, appid.ToString(), "library_600x900.jpg"),
+                };
+                foreach (string lc in local)
+                    if (File.Exists(lc))
+                    {
+                        try { data = File.ReadAllBytes(lc); break; }
+                        catch (Exception) { }
+                    }
+
+                // hash-subfolder layout: {appid}/{hash}/library_600x900.jpg
+                if (data == null)
+                {
+                    try
+                    {
+                        string sub = Path.Combine(cache, appid.ToString());
+                        if (Directory.Exists(sub))
+                            foreach (string pattern in new string[]
+                                     { "library_600x900*", "library_capsule.*", "capsule*" })
+                            {
+                                string[] found = Directory.GetFiles(sub, pattern,
+                                                                    SearchOption.AllDirectories);
+                                if (found.Length > 0)
+                                {
+                                    data = File.ReadAllBytes(found[0]);
+                                    break;
+                                }
+                            }
+                    }
+                    catch (Exception) { }
+                }
+
+                if (data == null)
+                    foreach (string cdn in SteamStore.CdnBases)
                     {
                         try
                         {
-                            string sub = Path.Combine(cache, appid.ToString());
-                            if (Directory.Exists(sub))
-                                foreach (string pattern in new string[]
-                                         { "library_600x900*", "library_capsule.*", "capsule*" })
-                                {
-                                    string[] found = Directory.GetFiles(sub, pattern,
-                                                                        SearchOption.AllDirectories);
-                                    if (found.Length > 0)
-                                    {
-                                        data = File.ReadAllBytes(found[0]);
-                                        break;
-                                    }
-                                }
+                            using (var wc = new WebClient())
+                            {
+                                wc.Headers["User-Agent"] = "SteamGridDBFetcher/1.0";
+                                data = wc.DownloadData(cdn + appid + "/library_600x900.jpg");
+                            }
+                            break;
                         }
                         catch (Exception) { }
                     }
 
-                    if (data == null)
-                        foreach (string cdn in SteamStore.CdnBases)
-                        {
-                            try
-                            {
-                                using (var wc = new WebClient())
-                                {
-                                    wc.Headers["User-Agent"] = "SteamGridDBFetcher/1.0";
-                                    data = wc.DownloadData(cdn + appid + "/library_600x900.jpg");
-                                }
-                                break;
-                            }
-                            catch (Exception) { }
-                        }
-
-                    if (data == null) return;
-                    using (var src = Image.FromStream(new MemoryStream(data)))
-                        bmp = ScaleCover(src);
-                }
-                catch (Exception) { return; }
-                try
-                {
-                    BeginInvoke((MethodInvoker)delegate
-                    {
-                        if (steamCoverCache.ContainsKey(appid)) { bmp.Dispose(); return; }
-                        steamCoverCache[appid] = bmp;
-                        if (g != libGen) return;
-                        libGrid.RefreshItem(appid);
-                    });
-                }
-                catch (Exception) { bmp.Dispose(); }   // window closed
-            });
+                if (data == null) return null;
+                using (var src = Image.FromStream(new MemoryStream(data)))
+                    return ScaleCover(src);
+            }
+            catch (Exception) { return null; }
         }
 
         // ------------------------------------------------------ batch fill
+
+        static string NormName(string s)
+        {
+            return new string(s.ToLowerInvariant().Where(c => char.IsLetterOrDigit(c)).ToArray());
+        }
+
+        // Best search hit for an unattended pick: an exact (normalized) name match
+        // beats SteamGridDB's own ranking; otherwise fall back to its top result.
+        static SgdbGame BestMatch(List<SgdbGame> res, string name)
+        {
+            string n = NormName(name);
+            if (n.Length > 0)
+                foreach (SgdbGame g in res)
+                    if (NormName(g.Name) == n) return g;
+            return res[0];
+        }
+
+        // Unattended picks must be safe to apply without looking: static, and
+        // not tagged adult or epilepsy. Null when the page has no such asset.
+        static SgdbAsset SafePick(List<SgdbAsset> list)
+        {
+            foreach (SgdbAsset a in list)
+                if (!a.Nsfw && !a.Epilepsy && !a.Animated) return a;
+            return null;
+        }
 
         // Fill ONLY missing asset slots for the games currently visible in the
         // library. Official Steam defaults first, SteamGridDB top results as
@@ -2302,6 +2438,7 @@ namespace SteamGridDBFetcher
             batchStrip.Visible = true;
             stripHideTimer.Stop();
             int updated = 0, none = 0;
+            string opStamp = NewBackupStamp();
             try
             {
                 for (int i = 0; i < targets.Count; i++)
@@ -2319,12 +2456,13 @@ namespace SteamGridDBFetcher
                     catch (Exception) { }
                     if (res != null && res.Count > 0)
                     {
-                        int steamId = await api.SteamAppId(res[0].Id);
+                        SgdbGame match = BestMatch(res, sc.Name);
+                        int steamId = await api.SteamAppId(match.Id);
                         if (steamId > 0)
                         {
                             foreach (AType t in missing.ToList())
                             {
-                                if (await SteamStore.Apply(gridDir, sc.AppId, t, steamId, stamp) != null)
+                                if (await SteamStore.Apply(gridDir, sc.AppId, t, steamId, opStamp) != null)
                                 {
                                     missing.Remove(t);
                                     wrote = true;
@@ -2335,14 +2473,16 @@ namespace SteamGridDBFetcher
                         {
                             try
                             {
-                                var assets = t.Key == "logo"
-                                    ? await api.OfficialLogos(res[0].Id)
-                                    : new List<SgdbAsset>();
-                                if (assets.Count == 0)
-                                    assets = await api.Assets(res[0].Id, t);
-                                if (assets.Count > 0)
+                                // official logos first; otherwise the top SAFE
+                                // community asset (never adult/epilepsy/animated
+                                // without the user seeing it)
+                                SgdbAsset pick = t.Key == "logo"
+                                    ? SafePick(await api.OfficialLogos(match.Id)) : null;
+                                if (pick == null)
+                                    pick = SafePick(await api.Assets(match.Id, t));
+                                if (pick != null)
                                 {
-                                    await Artwork.Apply(gridDir, sc.AppId, t, assets[0].Url, stamp);
+                                    await Artwork.Apply(gridDir, sc.AppId, t, pick.Url, opStamp);
                                     wrote = true;
                                 }
                             }
@@ -2369,6 +2509,8 @@ namespace SteamGridDBFetcher
 
         void OpenDetail(Shortcut sc)
         {
+            ReindexGame(sc.AppId);   // pick up anything changed outside the app
+            slotState[sc.AppId] = ComputeSlots(sc.AppId);
             currentShortcut = sc;
             staged.Clear();
             lastUndo = null;
@@ -2389,6 +2531,7 @@ namespace SteamGridDBFetcher
             currentSgdbId = -1;
             currentShortcut = null;
             staged.Clear();
+            heroPb.Image = null;   // may point at a tile image that's about to be freed
             ClearSections();
             detailView.Visible = false;
             libraryView.Visible = true;
@@ -2449,6 +2592,9 @@ namespace SteamGridDBFetcher
             UpdateButtons();
         }
 
+        // The rail's poster. Uses the already-decoded library cover (the hero box
+        // is smaller than it) instead of re-reading and decoding the full-size
+        // file on the UI thread every time a tile is staged.
         void UpdateHero()
         {
             if (currentShortcut == null) return;
@@ -2459,45 +2605,62 @@ namespace SteamGridDBFetcher
                 var tpb = pk.Tile.Controls[0] as PictureBox;
                 if (tpb != null && tpb.Image != null)
                 {
-                    heroPb.Image = tpb.Image;
+                    // for an animated tile use its cached still, never a live
+                    // animation frame (frames are freed when the clip cache evicts)
+                    Image still;
+                    heroPb.Image = animStill.TryGetValue(tpb, out still) && still != null ? still : tpb.Image;
                     return;
                 }
             }
-            string p = FindExisting(currentShortcut.AppId, "p");
-            Image img = null;
-            if (p != null)
+            uint appid = currentShortcut.AppId;
+            Image cover;
+            if (coverImages.TryGetValue(appid, out cover)) { heroPb.Image = cover; return; }
+            if (FindExisting(appid, "p") != null)
             {
-                try
-                {
-                    byte[] hb = File.ReadAllBytes(p);
-                    // animated covers are webp bytes in a .png file (GDI+ can't read webp)
-                    try { img = Image.FromStream(new MemoryStream(hb)); }
-                    catch (Exception) { img = WicDecode(hb); }
-                }
-                catch (Exception) { }
+                heroPb.Image = GetPlaceholder(currentShortcut);   // until the decode lands
+                EnsureCoverAsync(appid);
+                return;
             }
-            if (img == null && currentShortcut.IsSteam)
+            if (currentShortcut.IsSteam && steamCoverCache.TryGetValue(appid, out cover))
             {
-                Image sc;
-                if (steamCoverCache.TryGetValue(currentShortcut.AppId, out sc))
-                {
-                    heroPb.Image = sc;
-                    if (heroOwned != null) { heroOwned.Dispose(); heroOwned = null; }
-                    return;
-                }
+                heroPb.Image = cover;
+                return;
             }
-            if (img != null)
+            heroPb.Image = GetPlaceholder(currentShortcut);
+        }
+
+        readonly HashSet<uint> coverLoading = new HashSet<uint>();
+
+        // Decode a game's custom cover into the shared cache off the UI thread,
+        // then refresh whatever shows it.
+        async void EnsureCoverAsync(uint appid)
+        {
+            string p = FindExisting(appid, "p");
+            if (p == null || coverImages.ContainsKey(appid) || !coverLoading.Add(appid)) return;
+            Bitmap bmp;
+            try { bmp = await Task.Run(() => DecodeCoverFile(p)); }
+            finally { coverLoading.Remove(appid); }
+            if (bmp == null) return;
+            if (coverImages.ContainsKey(appid)) { bmp.Dispose(); return; }
+            coverImages[appid] = bmp;
+            libGrid.RefreshItem(appid);
+            if (currentShortcut != null && currentShortcut.AppId == appid) UpdateHero();
+        }
+
+        // Read + decode a cover file (animated covers are webp bytes in a .png,
+        // which GDI+ can't read - WIC handles those) and scale it to card size.
+        static Bitmap DecodeCoverFile(string path)
+        {
+            try
             {
-                Image prev = heroOwned;
-                heroOwned = img;
-                heroPb.Image = img;
-                if (prev != null) prev.Dispose();
+                byte[] b = File.ReadAllBytes(path);   // read bytes so the file isn't locked
+                Image src;
+                try { src = Image.FromStream(new MemoryStream(b)); }
+                catch (Exception) { src = WicDecode(b); }
+                if (src == null) return null;
+                using (src) return ScaleCover(src);
             }
-            else
-            {
-                heroPb.Image = GetPlaceholder(currentShortcut);
-                if (heroOwned != null) { heroOwned.Dispose(); heroOwned = null; }
-            }
+            catch (Exception) { return null; }
         }
 
         // ------------------------------------------------------ picker: search
@@ -2512,6 +2675,8 @@ namespace SteamGridDBFetcher
             var old = sectionsFlow.Controls.Cast<Control>().ToList();
             sectionsFlow.Controls.Clear();
             foreach (Control c in old) c.Dispose();
+            foreach (Image im in tileOwned) im.Dispose();   // tiles are gone now
+            tileOwned.Clear();
         }
 
         void ShowPlaceholder(string text)
@@ -2698,21 +2863,9 @@ namespace SteamGridDBFetcher
                     SizeMode = PictureBoxSizeMode.Zoom, BackColor = FIELD, Cursor = Cursors.Hand
                 };
                 if (existingPath != null)
-                {
-                    try
-                    {
-                        byte[] bytes = File.ReadAllBytes(existingPath);
-                        try { pb.Image = Image.FromStream(new MemoryStream(bytes)); }
-                        // applied animated art is webp bytes in a .png file, which
-                        // GDI+ can't read - fall back to the WIC (webp) decoder
-                        catch (Exception) { pb.Image = WicDecode(bytes); }
-                    }
-                    catch (Exception) { }
-                }
+                    LoadFileInto(pb, existingPath);
                 else
-                {
                     LoadSteamDefaultInto(pb, game.AppId, t.Key);
-                }
                 p.Controls.Add(pb);
                 pb.Click += h;
             }
@@ -2783,13 +2936,51 @@ namespace SteamGridDBFetcher
             return null;
         }
 
+        // Images owned by the open game's tiles ("current", Steam default,
+        // fallback thumbs). PictureBox never disposes its Image, so without this
+        // every game you opened leaked several (sometimes 1920px) bitmaps.
+        readonly List<Image> tileOwned = new List<Image>();
+
+        void SetOwnedImage(PictureBox pb, Image img, int g)
+        {
+            if (img == null) return;
+            if (g != gen || pb.IsDisposed) { img.Dispose(); return; }
+            tileOwned.Add(img);
+            pb.Image = img;
+        }
+
+        // Decode image bytes (webp-in-.png via WIC as fallback) and shrink to fit.
+        static Image DecodeFit(byte[] b, int w, int h)
+        {
+            if (b == null) return null;
+            try
+            {
+                Image src;
+                try { src = Image.FromStream(new MemoryStream(b)); }
+                catch (Exception) { src = WicDecode(b); }
+                return FitDownscale(src, w, h);
+            }
+            catch (Exception) { return null; }
+        }
+
+        // An existing grid file for a "current" tile, decoded off the UI thread.
+        async void LoadFileInto(PictureBox pb, string path)
+        {
+            int g = gen, w = pb.Width, h = pb.Height;
+            Image img = await Task.Run<Image>(() =>
+            {
+                byte[] b;
+                try { b = File.ReadAllBytes(path); } catch (Exception) { return null; }
+                return DecodeFit(b, w, h);
+            });
+            SetOwnedImage(pb, img, g);
+        }
+
         async void LoadSteamDefaultInto(PictureBox pb, uint appid, string typeKey)
         {
-            int g = gen;
-            byte[] data = await Task.Run(() => SteamDefaultBytes(appid, typeKey));
-            if (data == null || g != gen || pb.IsDisposed) return;
-            try { pb.Image = Image.FromStream(new MemoryStream(data)); }
-            catch (Exception) { }
+            int g = gen, w = pb.Width, h = pb.Height;
+            Image img = await Task.Run<Image>(() => DecodeFit(SteamDefaultBytes(appid, typeKey), w, h));
+            SetOwnedImage(pb, img, g);
         }
 
         // The game's original Steam asset, selectable like any other pick.
@@ -2804,9 +2995,11 @@ namespace SteamGridDBFetcher
             }
             if (data == null) return;   // no official asset of this type
             if (g != gen || flow.IsDisposed) return;
-            Image img;
-            try { img = Image.FromStream(new MemoryStream(data)); }
-            catch (Exception) { return; }
+            int tw = t.W, th = t.H - CapH;
+            Image img = await Task.Run<Image>(() => DecodeFit(data, tw, th));
+            if (img == null) return;
+            if (g != gen || flow.IsDisposed) { img.Dispose(); return; }
+            tileOwned.Add(img);
 
             string selUrl = "official:" + steamId;
             var p = new Panel
@@ -3074,7 +3267,7 @@ namespace SteamGridDBFetcher
                 pb.Image = img;
                 if (asset.Animated) animStill[pb] = img;   // to restore after hover
             }
-            else pb.Image = TextThumb(pb.Width, pb.Height);
+            else SetOwnedImage(pb, TextThumb(pb.Width, pb.Height), g);
             MaybeUpdateHero(pb);
         }
 
@@ -3360,36 +3553,57 @@ namespace SteamGridDBFetcher
             SetRailStatus("Applying " + staged.Count + " change(s)...", false);
             var record = new List<UndoItem>();
             var written = new List<string>();
+            var failed = new List<string>();
+            string opStamp = NewBackupStamp();
             try
             {
+                // each slot on its own: one failure must not lose the undo record
+                // (or the refresh) for the slots that were already written
                 foreach (var kv in staged.ToList())
                 {
                     AType t = Cfg.Types.First(x => x.Key == kv.Key);
-                    ApplyResult r;
-                    if (kv.Value.Value.StartsWith("official:"))
-                        r = await SteamStore.Apply(gridDir, game.AppId, t,
-                                int.Parse(kv.Value.Value.Substring("official:".Length)), stamp);
-                    else
-                        r = await Artwork.Apply(gridDir, game.AppId, t, kv.Value.Value, stamp);
-                    if (r != null)
+                    try
                     {
-                        record.Add(new UndoItem { Type = t, BackupPaths = r.BackupPaths });
-                        written.Add(t.Short);
+                        ApplyResult r;
+                        if (kv.Value.Value.StartsWith("official:"))
+                            r = await SteamStore.Apply(gridDir, game.AppId, t,
+                                    int.Parse(kv.Value.Value.Substring("official:".Length)), opStamp);
+                        else
+                            r = await Artwork.Apply(gridDir, game.AppId, t, kv.Value.Value, opStamp);
+                        if (r != null)
+                        {
+                            record.Add(new UndoItem { Type = t, BackupPaths = r.BackupPaths });
+                            written.Add(t.Short);
+                            staged.Remove(kv.Key);
+                        }
+                        else failed.Add(t.Short + " (not available)");
                     }
+                    catch (Exception ex) { failed.Add(t.Short + " (" + ex.Message + ")"); }
                 }
-                lastUndo = record;
-                lastUndoApp = game.AppId;
-                staged.Clear();
-                applied.Add(game.AppId);
-                RefreshGame(game.AppId);
-                RefreshAllHighlights();
-                UpdateRail();
-                undoLink.Visible = record.Count > 0;
-                SetRailStatus("Applied: " + string.Join(", ", written) +
-                              ". Old files were backed up. Press F5 in your Steam library to see it.", true);
             }
-            catch (Exception ex) { SetRailError("Apply failed: " + ex.Message); }
-            finally { busy = false; UpdateButtons(); }
+            finally
+            {
+                if (record.Count > 0)
+                {
+                    lastUndo = record;
+                    lastUndoApp = game.AppId;
+                    applied.Add(game.AppId);
+                    undoLink.Visible = true;
+                }
+                RefreshGame(game.AppId);
+                if (currentShortcut == game) RefreshAllHighlights();
+                busy = false;
+                UpdateRail();
+                if (failed.Count == 0)
+                    SetRailStatus("Applied: " + string.Join(", ", written) +
+                                  ". Old files were backed up. Press F5 in your Steam library to see it.", true);
+                else if (written.Count > 0)
+                    SetRailError("Applied " + string.Join(", ", written) + ", but failed: " +
+                                 string.Join("; ", failed) + ". Failed picks are still staged - Apply to retry.");
+                else
+                    SetRailError("Apply failed: " + string.Join("; ", failed) + ". Picks are still staged.");
+                UpdateButtons();
+            }
         }
 
         void UndoLast()
@@ -3439,7 +3653,11 @@ namespace SteamGridDBFetcher
                 }
                 List<Panel> list;
                 if (!tiles.TryGetValue(t.Key, out list)) continue;
-                Panel first = list.FirstOrDefault(p => !p.IsDisposed && p.Visible && tileAssets.ContainsKey(p));
+                // prefer a static, non-adult, non-epilepsy asset; otherwise the top
+                // visible one (it's only staged - you review it before Apply)
+                Panel first = list.FirstOrDefault(p => !p.IsDisposed && p.Visible && tileAssets.ContainsKey(p)
+                                                       && SafePick(new List<SgdbAsset> { tileAssets[p] }) != null)
+                              ?? list.FirstOrDefault(p => !p.IsDisposed && p.Visible && tileAssets.ContainsKey(p));
                 if (first != null)
                 {
                     SgdbAsset a = tileAssets[first];
