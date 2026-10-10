@@ -431,29 +431,83 @@ namespace SteamGridDBFetcher
             return (await GetRaw(url)) as object[] ?? new object[0];
         }
 
-        // The Steam store appid SteamGridDB has linked to this game (this is
-        // what powers the site's "Original Steam Assets" panel); 0 if none.
-        public async Task<int> SteamAppId(int gameId)
+        // SteamGridDB's "Original Steam Assets" for a game: the linked Steam appid
+        // plus the exact file path of each official asset, from its platform data
+        // (the same data its own "View Original Steam Assets" panel uses). Null if
+        // the game isn't linked to Steam.
+        public async Task<SteamArt> SteamArtFor(int gameId)
         {
             try
             {
-                var d = await GetRaw(Base + "/games/id/" + gameId + "?platformdata=steam")
-                        as Dictionary<string, object>;
-                if (d == null) return 0;
-                object epd;
-                if (!d.TryGetValue("external_platform_data", out epd)) return 0;
-                var ep = epd as Dictionary<string, object>;
-                object steamArr;
-                if (ep == null || !ep.TryGetValue("steam", out steamArr)) return 0;
-                var arr = steamArr as object[];
-                if (arr == null || arr.Length == 0) return 0;
-                var first = arr[0] as Dictionary<string, object>;
-                object idv;
-                if (first != null && first.TryGetValue("id", out idv))
-                    return Convert.ToInt32(idv);
+                return ParseSteamArt(await GetRaw(Base + "/games/id/" + gameId + "?platformdata=steam")
+                                     as Dictionary<string, object>);
             }
-            catch (Exception) { }
-            return 0;
+            catch (Exception) { return null; }
+        }
+
+        // Same, looked up by Steam appid (for installed Steam-store games).
+        public async Task<SteamArt> SteamArtForSteamApp(uint appid)
+        {
+            try
+            {
+                return ParseSteamArt(await GetRaw(Base + "/games/steam/" + appid + "?platformdata=steam")
+                                     as Dictionary<string, object>);
+            }
+            catch (Exception) { return null; }
+        }
+
+        static SteamArt ParseSteamArt(Dictionary<string, object> d)
+        {
+            if (d == null) return null;
+            object epd, steamArr, idv, mdv;
+            var ep = d.TryGetValue("external_platform_data", out epd) ? epd as Dictionary<string, object> : null;
+            if (ep == null || !ep.TryGetValue("steam", out steamArr)) return null;
+            var arr = steamArr as object[];
+            if (arr == null || arr.Length == 0) return null;
+            var first = arr[0] as Dictionary<string, object>;
+            if (first == null || !first.TryGetValue("id", out idv)) return null;
+            var art = new SteamArt { AppId = Convert.ToInt32(idv) };
+            var md = first.TryGetValue("metadata", out mdv) ? mdv as Dictionary<string, object> : null;
+            if (md == null) return art;
+
+            object v;
+            if (md.TryGetValue("store_asset_mtime", out v) && v != null)
+                try { art.Mtime = Convert.ToInt64(v); } catch (Exception) { }
+
+            // header: { lang: "hash/header.jpg" }, 2x = same name with _2x
+            if (md.TryGetValue("header_image_full", out v))
+            {
+                string h = PickLang(v);
+                if (h != null)
+                    art.Paths["wide"] = new List<string> { Regex.Replace(h, @"\.jpg$", "_2x.jpg"), h };
+            }
+            // capsule/hero/logo: { image: { lang: path }, image2x: { lang: path } }
+            AddImagePair(art, md, "library_capsule_full", "cover");
+            AddImagePair(art, md, "library_hero_full", "background");
+            AddImagePair(art, md, "library_logo_full", "logo");
+            return art;
+        }
+
+        static void AddImagePair(SteamArt art, Dictionary<string, object> md, string field, string key)
+        {
+            object v, img, img2x;
+            var m = md.TryGetValue(field, out v) ? v as Dictionary<string, object> : null;
+            if (m == null) return;
+            var list = new List<string>();
+            if (m.TryGetValue("image2x", out img2x)) { string p = PickLang(img2x); if (p != null) list.Add(p); }
+            if (m.TryGetValue("image", out img)) { string p = PickLang(img); if (p != null) list.Add(p); }
+            if (list.Count > 0) art.Paths[key] = list;
+        }
+
+        // { "english": "...", "japanese": "..." } -> english if present, else any.
+        static string PickLang(object o)
+        {
+            var m = o as Dictionary<string, object>;
+            if (m == null || m.Count == 0) return null;
+            object v;
+            if (m.TryGetValue("english", out v) && v is string) return (string)v;
+            foreach (object x in m.Values) if (x is string) return (string)x;
+            return null;
         }
 
         static bool Flag(Dictionary<string, object> a, string key)
@@ -610,17 +664,30 @@ namespace SteamGridDBFetcher
     // the site's "Original Steam Assets" panel uses); these are the files it
     // links to.
 
+    // A game's original Steam assets as SteamGridDB describes them.
+    class SteamArt
+    {
+        public int AppId;
+        public long Mtime;   // store_asset_mtime (cache-buster, like the SGDB panel uses)
+        // slot key -> file paths under <appid>/ from SGDB's platform data, 2x first
+        public readonly Dictionary<string, List<string>> Paths = new Dictionary<string, List<string>>();
+    }
+
     static class SteamStore
     {
-        // Valve serves official art from two CDN layouts; newer titles often
-        // exist only on the second one.
-        public static readonly string[] CdnBases = new string[]
+        // Where SteamGridDB's "Original Steam Assets" panel loads every image from.
+        const string Shared = "https://shared.steamstatic.com/store_item_assets/steam/apps/";
+
+        // Older titles still also have their art at fixed names on the old CDN.
+        static readonly string[] CdnBases = new string[]
         {
+            Shared,
             "https://cdn.cloudflare.steamstatic.com/steam/apps/",
-            "https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/",
         };
 
-        // The default artwork files Steam itself uses for every store game.
+        // Legacy fixed filenames - only a fallback now. Newer games keep their
+        // art at hashed paths (e.g. <hash>/library_capsule_2x.jpg), which only
+        // SteamGridDB's platform data tells us.
         static readonly Dictionary<string, string[]> Files = new Dictionary<string, string[]>
         {
             { "cover",      new string[] { "library_600x900_2x.jpg", "library_600x900.jpg" } },
@@ -629,25 +696,40 @@ namespace SteamGridDBFetcher
             { "logo",       new string[] { "logo_2x.png", "logo.png" } },
         };
 
-        // Preview candidates (always-present non-2x variant, on each CDN).
-        public static List<string> PreviewUrls(int steamId, string key)
+        // Candidate URLs for one slot: SteamGridDB's exact paths first (built the
+        // same way its panel builds them), then the legacy names. Previews try the
+        // smaller 1x file first; applying tries the 2x (highest quality) first.
+        static List<string> Urls(SteamArt art, string key, bool preview)
         {
-            string[] f = Files[key];
-            string file = f[f.Length - 1];
             var list = new List<string>();
-            foreach (string cdn in CdnBases) list.Add(cdn + steamId + "/" + file);
+            List<string> paths;
+            if (art.Paths.TryGetValue(key, out paths))
+            {
+                var ordered = new List<string>(paths);
+                if (preview) ordered.Reverse();
+                string t = art.Mtime > 0 ? "?t=" + art.Mtime : "";
+                foreach (string p in ordered) list.Add(Shared + art.AppId + "/" + p + t);
+            }
+            string[] f = Files[key];
+            var names = preview ? new string[] { f[f.Length - 1] } : f;
+            foreach (string n in names)
+                foreach (string cdn in CdnBases) list.Add(cdn + art.AppId + "/" + n);
             return list;
         }
 
-        // Apply the official Steam default for one asset type. Null if unavailable.
-        public static async Task<ApplyResult> Apply(string gdir, uint appid, AType t, int steamId, string stamp)
+        public static List<string> PreviewUrls(SteamArt art, string key)
         {
-            foreach (string f in Files[t.Key])
-                foreach (string cdn in CdnBases)
-                {
-                    try { return await Artwork.Apply(gdir, appid, t, cdn + steamId + "/" + f, stamp); }
-                    catch (Exception) { }
-                }
+            return Urls(art, key, true);
+        }
+
+        // Apply the official Steam asset for one slot. Null if unavailable.
+        public static async Task<ApplyResult> Apply(string gdir, uint appid, AType t, SteamArt art, string stamp)
+        {
+            foreach (string u in Urls(art, t.Key, false))
+            {
+                try { return await Artwork.Apply(gdir, appid, t, u, stamp); }
+                catch (Exception) { }
+            }
             return null;
         }
     }
@@ -1377,6 +1459,7 @@ namespace SteamGridDBFetcher
         readonly Dictionary<string, Panel> currentTiles = new Dictionary<string, Panel>();
         readonly Dictionary<string, Panel> officialTiles = new Dictionary<string, Panel>();
         readonly Dictionary<string, Pick> staged = new Dictionary<string, Pick>();
+        readonly Dictionary<int, SteamArt> steamArts = new Dictionary<int, SteamArt>();   // by Steam appid
         readonly List<SgdbGame> matches = new List<SgdbGame>();
         readonly SemaphoreSlim thumbSem = new SemaphoreSlim(6);
         List<UndoItem> lastUndo;
@@ -2324,6 +2407,35 @@ namespace SteamGridDBFetcher
             if (!steamCoverQueue.IsEmpty) EnsureSteamCoverWorker();   // raced with a new enqueue
         }
 
+        // SteamGridDB's original-Steam-asset data for an installed Steam game
+        // (blocking - background threads only). Falls back to just the appid,
+        // which still allows the legacy filenames for older games.
+        SteamArt SteamArtForInstalled(uint appid)
+        {
+            SteamArt art = null;
+            try { if (api != null) art = api.SteamArtForSteamApp(appid).GetAwaiter().GetResult(); }
+            catch (Exception) { }
+            return art ?? new SteamArt { AppId = (int)appid };
+        }
+
+        // First URL that downloads successfully (blocking - background threads only).
+        static byte[] DownloadFirst(List<string> urls)
+        {
+            foreach (string u in urls)
+            {
+                try
+                {
+                    using (var wc = new WebClient())
+                    {
+                        wc.Headers["User-Agent"] = "SteamGridDBFetcher/1.0";
+                        return wc.DownloadData(u);
+                    }
+                }
+                catch (Exception) { }
+            }
+            return null;
+        }
+
         Bitmap LoadSteamCover(uint appid)
         {
             try
@@ -2365,19 +2477,7 @@ namespace SteamGridDBFetcher
                 }
 
                 if (data == null)
-                    foreach (string cdn in SteamStore.CdnBases)
-                    {
-                        try
-                        {
-                            using (var wc = new WebClient())
-                            {
-                                wc.Headers["User-Agent"] = "SteamGridDBFetcher/1.0";
-                                data = wc.DownloadData(cdn + appid + "/library_600x900.jpg");
-                            }
-                            break;
-                        }
-                        catch (Exception) { }
-                    }
+                    data = DownloadFirst(SteamStore.PreviewUrls(SteamArtForInstalled(appid), "cover"));
 
                 if (data == null) return null;
                 using (var src = Image.FromStream(new MemoryStream(data)))
@@ -2457,12 +2557,12 @@ namespace SteamGridDBFetcher
                     if (res != null && res.Count > 0)
                     {
                         SgdbGame match = BestMatch(res, sc.Name);
-                        int steamId = await api.SteamAppId(match.Id);
-                        if (steamId > 0)
+                        SteamArt steamArt = await api.SteamArtFor(match.Id);
+                        if (steamArt != null)
                         {
                             foreach (AType t in missing.ToList())
                             {
-                                if (await SteamStore.Apply(gridDir, sc.AppId, t, steamId, opStamp) != null)
+                                if (await SteamStore.Apply(gridDir, sc.AppId, t, steamArt, opStamp) != null)
                                 {
                                     missing.Remove(t);
                                     wrote = true;
@@ -2788,13 +2888,14 @@ namespace SteamGridDBFetcher
                 pageTasks[t.Key] = api.AssetsPaged(gameId, t, 0);
 
             // offer the game's original Steam assets as picks
-            int steamId = 0;
-            try { steamId = await api.SteamAppId(gameId); }
-            catch (Exception) { }
+            SteamArt steamArt = await api.SteamArtFor(gameId);
             if (g != gen) return;
-            if (steamId > 0)
+            if (steamArt != null)
+            {
+                steamArts[steamArt.AppId] = steamArt;   // for Apply
                 foreach (AType t in Cfg.Types)
-                    AddOfficialTile(t, flows[t.Key], steamId, g);
+                    AddOfficialTile(t, flows[t.Key], steamArt, g);
+            }
 
             pageByType.Clear();
             totalByType.Clear();
@@ -2834,6 +2935,38 @@ namespace SteamGridDBFetcher
         // First tile of every row: what the game has right now. Clicking it
         // means "keep as is" (unstage). For Steam-store games without custom
         // art, "current" is the game's official Steam default - show it.
+        // Rebuild each row's first ("current") tile from what's on disk now, so it
+        // reflects an Apply/Undo without leaving and re-opening the game.
+        void RefreshCurrentTiles()
+        {
+            Shortcut game = currentShortcut;
+            if (game == null) return;
+            foreach (AType t in Cfg.Types)
+            {
+                FlowLayoutPanel flow;
+                Panel old;
+                if (!flows.TryGetValue(t.Key, out flow) || !currentTiles.TryGetValue(t.Key, out old)) continue;
+                flow.SuspendLayout();
+                flow.Controls.Remove(old);
+                tiles[t.Key].Remove(old);
+                foreach (Control c in old.Controls)
+                {
+                    var opb = c as PictureBox;
+                    if (opb != null && opb.Image != null && tileOwned.Remove(opb.Image))
+                    {
+                        Image im = opb.Image;
+                        opb.Image = null;
+                        im.Dispose();
+                    }
+                }
+                old.Dispose();
+                AddCurrentTile(t, flow, FindExisting(game.AppId, t.Suffix), game);
+                flow.Controls.SetChildIndex(currentTiles[t.Key], 0);   // stays first in the row
+                flow.ResumeLayout();
+                UpdateHighlights(t.Key);
+            }
+        }
+
         void AddCurrentTile(AType t, FlowLayoutPanel flow, string existingPath, Shortcut game)
         {
             bool steamDefault = existingPath == null && game != null && game.IsSteam;
@@ -2921,19 +3054,7 @@ namespace SteamGridDBFetcher
                     }
             }
             catch (Exception) { }
-            foreach (string u in SteamStore.PreviewUrls((int)appid, typeKey))
-            {
-                try
-                {
-                    using (var wc = new WebClient())
-                    {
-                        wc.Headers["User-Agent"] = "SteamGridDBFetcher/1.0";
-                        return wc.DownloadData(u);
-                    }
-                }
-                catch (Exception) { }
-            }
-            return null;
+            return DownloadFirst(SteamStore.PreviewUrls(SteamArtForInstalled(appid), typeKey));
         }
 
         // Images owned by the open game's tiles ("current", Steam default,
@@ -2985,10 +3106,10 @@ namespace SteamGridDBFetcher
 
         // The game's original Steam asset, selectable like any other pick.
         // Only appears when the file actually exists on Steam's CDN.
-        async void AddOfficialTile(AType t, FlowLayoutPanel flow, int steamId, int g)
+        async void AddOfficialTile(AType t, FlowLayoutPanel flow, SteamArt art, int g)
         {
             byte[] data = null;
-            foreach (string u in SteamStore.PreviewUrls(steamId, t.Key))
+            foreach (string u in SteamStore.PreviewUrls(art, t.Key))
             {
                 try { data = await Sgdb.Download(u); break; }
                 catch (Exception) { }
@@ -3001,7 +3122,7 @@ namespace SteamGridDBFetcher
             if (g != gen || flow.IsDisposed) { img.Dispose(); return; }
             tileOwned.Add(img);
 
-            string selUrl = "official:" + steamId;
+            string selUrl = "official:" + art.AppId;
             var p = new Panel
             {
                 Size = new Size(t.W + 10, t.H + 10), BackColor = BG2,
@@ -3566,8 +3687,12 @@ namespace SteamGridDBFetcher
                     {
                         ApplyResult r;
                         if (kv.Value.Value.StartsWith("official:"))
-                            r = await SteamStore.Apply(gridDir, game.AppId, t,
-                                    int.Parse(kv.Value.Value.Substring("official:".Length)), opStamp);
+                        {
+                            int sid = int.Parse(kv.Value.Value.Substring("official:".Length));
+                            SteamArt art;
+                            if (!steamArts.TryGetValue(sid, out art)) art = new SteamArt { AppId = sid };
+                            r = await SteamStore.Apply(gridDir, game.AppId, t, art, opStamp);
+                        }
                         else
                             r = await Artwork.Apply(gridDir, game.AppId, t, kv.Value.Value, opStamp);
                         if (r != null)
@@ -3591,7 +3716,11 @@ namespace SteamGridDBFetcher
                     undoLink.Visible = true;
                 }
                 RefreshGame(game.AppId);
-                if (currentShortcut == game) RefreshAllHighlights();
+                if (currentShortcut == game)
+                {
+                    RefreshCurrentTiles();
+                    RefreshAllHighlights();
+                }
                 busy = false;
                 UpdateRail();
                 if (failed.Count == 0)
@@ -3626,6 +3755,7 @@ namespace SteamGridDBFetcher
                 undoLink.Visible = false;
                 applied.Remove(lastUndoApp);
                 RefreshGame(lastUndoApp);
+                if (currentShortcut != null && currentShortcut.AppId == lastUndoApp) RefreshCurrentTiles();
                 UpdateRail();
                 SetRailStatus("Restored the previous artwork from backup.", false);
             }
