@@ -70,7 +70,8 @@ namespace SteamGridDBFetcher
     class AssetPage
     {
         public List<SgdbAsset> Assets = new List<SgdbAsset>();
-        public int Total;
+        public int Total;       // as reported by SGDB - NOT reliable (often double the real count)
+        public int Limit = 50;  // page size; a page shorter than this is the last one
     }
 
     class AType
@@ -628,6 +629,9 @@ namespace SteamGridDBFetcher
                 if (root.TryGetValue("data", out d) && d is object[])
                     res.Assets = ParseAssets((object[])d);
                 res.Total = root.TryGetValue("total", out tot) ? Convert.ToInt32(tot) : res.Assets.Count;
+                object lim;
+                if (root.TryGetValue("limit", out lim))
+                    try { res.Limit = Math.Max(1, Convert.ToInt32(lim)); } catch (Exception) { }
             }
             return res;
         }
@@ -1452,7 +1456,6 @@ namespace SteamGridDBFetcher
         readonly Dictionary<string, FlowLayoutPanel> flows = new Dictionary<string, FlowLayoutPanel>();
         readonly Dictionary<string, Label> countLabels = new Dictionary<string, Label>();
         readonly Dictionary<string, int> pageByType = new Dictionary<string, int>();
-        readonly Dictionary<string, int> totalByType = new Dictionary<string, int>();
         readonly Dictionary<string, int> shownByType = new Dictionary<string, int>();
         readonly Dictionary<string, List<Panel>> tiles = new Dictionary<string, List<Panel>>();
         readonly Dictionary<Panel, SgdbAsset> tileAssets = new Dictionary<Panel, SgdbAsset>();
@@ -2898,7 +2901,6 @@ namespace SteamGridDBFetcher
             }
 
             pageByType.Clear();
-            totalByType.Clear();
             shownByType.Clear();
             foreach (AType t in Cfg.Types)
             {
@@ -2912,18 +2914,18 @@ namespace SteamGridDBFetcher
                 if (g != gen) return;
 
                 pageByType[t.Key] = 0;
-                totalByType[t.Key] = pg.Total;
                 shownByType[t.Key] = pg.Assets.Count;
-                countLabels[t.Key].Text = pg.Total == 0
-                    ? "none available on SteamGridDB"
-                    : pg.Total + " available - click to stage a change";
+                // SGDB's "total" over-reports (often exactly double), so paging is
+                // driven by page fullness instead: a short or empty page is the end.
+                bool more = pg.Assets.Count >= pg.Limit;
+                UpdateCountLabel(t.Key, more);
 
                 for (int i = 0; i < pg.Assets.Count; i++)
                 {
                     Panel tile = AddAssetTile(t, flows[t.Key], pg.Assets[i]);
                     LoadThumb((PictureBox)tile.Controls[0], pg.Assets[i], g);
                 }
-                if (shownByType[t.Key] < pg.Total)
+                if (more)
                     AddLoadMoreTile(t, g);
             }
             if (g == gen)
@@ -3203,7 +3205,6 @@ namespace SteamGridDBFetcher
         // "Load more" tile at the end of a row when the server has more pages.
         void AddLoadMoreTile(AType t, int g)
         {
-            int remaining = totalByType[t.Key] - shownByType[t.Key];
             var p = new Panel
             {
                 Size = new Size(t.W + 10, t.H + 10), BackColor = BG3,
@@ -3212,7 +3213,7 @@ namespace SteamGridDBFetcher
             RoundControl(p, 12);
             var lbl = new Label
             {
-                Text = "Load more\n(" + remaining + " left)", ForeColor = ACC, BackColor = BG3,
+                Text = "Load more", ForeColor = ACC, BackColor = BG3,
                 Location = new Point(5, 5), Size = new Size(t.W, t.H),
                 TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand,
                 Font = new Font("Segoe UI", 9f, FontStyle.Bold)
@@ -3241,8 +3242,20 @@ namespace SteamGridDBFetcher
                 LoadThumb((PictureBox)tp.Controls[0], a, g);
             }
             shownByType[t.Key] += pg.Assets.Count;
-            if (pg.Assets.Count > 0 && shownByType[t.Key] < totalByType[t.Key])
+            bool more = pg.Assets.Count >= pg.Limit;
+            UpdateCountLabel(t.Key, more);
+            if (more)
                 AddLoadMoreTile(t, g);
+        }
+
+        void UpdateCountLabel(string key, bool more)
+        {
+            Label l;
+            if (!countLabels.TryGetValue(key, out l)) return;
+            int n = shownByType[key];
+            l.Text = n == 0 ? "none available on SteamGridDB"
+                   : more ? n + " loaded, more available - click to stage a change"
+                   : n + " available - click to stage a change";
         }
 
         // ---------------------------------------------- animated previews
