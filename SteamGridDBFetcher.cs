@@ -1457,6 +1457,8 @@ namespace SteamGridDBFetcher
         readonly Dictionary<string, Label> countLabels = new Dictionary<string, Label>();
         readonly Dictionary<string, int> pageByType = new Dictionary<string, int>();
         readonly Dictionary<string, int> shownByType = new Dictionary<string, int>();
+        readonly Dictionary<string, int> exactByType = new Dictionary<string, int>();     // real asset count, -1 while counting
+        readonly Dictionary<string, Label> loadMoreLabels = new Dictionary<string, Label>();
         readonly Dictionary<string, List<Panel>> tiles = new Dictionary<string, List<Panel>>();
         readonly Dictionary<Panel, SgdbAsset> tileAssets = new Dictionary<Panel, SgdbAsset>();
         readonly Dictionary<string, Panel> currentTiles = new Dictionary<string, Panel>();
@@ -2902,6 +2904,8 @@ namespace SteamGridDBFetcher
 
             pageByType.Clear();
             shownByType.Clear();
+            exactByType.Clear();
+            loadMoreLabels.Clear();
             foreach (AType t in Cfg.Types)
             {
                 AssetPage pg;
@@ -2918,7 +2922,8 @@ namespace SteamGridDBFetcher
                 // SGDB's "total" over-reports (often exactly double), so paging is
                 // driven by page fullness instead: a short or empty page is the end.
                 bool more = pg.Assets.Count >= pg.Limit;
-                UpdateCountLabel(t.Key, more);
+                exactByType[t.Key] = more ? -1 : pg.Assets.Count;
+                UpdateCountLabel(t.Key);
 
                 for (int i = 0; i < pg.Assets.Count; i++)
                 {
@@ -2926,7 +2931,10 @@ namespace SteamGridDBFetcher
                     LoadThumb((PictureBox)tile.Controls[0], pg.Assets[i], g);
                 }
                 if (more)
+                {
                     AddLoadMoreTile(t, g);
+                    CountAssets(t, gameId, pg, g);
+                }
             }
             if (g == gen)
                 SetRailStatus("Assets loaded. Click tiles to stage changes, then Apply.", true);
@@ -3213,12 +3221,13 @@ namespace SteamGridDBFetcher
             RoundControl(p, 12);
             var lbl = new Label
             {
-                Text = "Load more", ForeColor = ACC, BackColor = BG3,
+                Text = LoadMoreText(t.Key), ForeColor = ACC, BackColor = BG3,
                 Location = new Point(5, 5), Size = new Size(t.W, t.H),
                 TextAlign = ContentAlignment.MiddleCenter, Cursor = Cursors.Hand,
                 Font = new Font("Segoe UI", 9f, FontStyle.Bold)
             };
             p.Controls.Add(lbl);
+            loadMoreLabels[t.Key] = lbl;
             EventHandler h = delegate { LoadMore(t, p, lbl, g); };
             p.Click += h; lbl.Click += h;
             flows[t.Key].Controls.Add(p);
@@ -3242,20 +3251,71 @@ namespace SteamGridDBFetcher
                 LoadThumb((PictureBox)tp.Controls[0], a, g);
             }
             shownByType[t.Key] += pg.Assets.Count;
-            bool more = pg.Assets.Count >= pg.Limit;
-            UpdateCountLabel(t.Key, more);
-            if (more)
-                AddLoadMoreTile(t, g);
+            if (pg.Assets.Count < pg.Limit)
+                exactByType[t.Key] = shownByType[t.Key];   // short/empty page: that's the end
+            int ex = exactByType[t.Key];
+            bool more = ex >= 0 ? shownByType[t.Key] < ex : pg.Assets.Count >= pg.Limit;
+            UpdateCountLabel(t.Key);
+            if (more) AddLoadMoreTile(t, g);
+            else loadMoreLabels.Remove(t.Key);
         }
 
-        void UpdateCountLabel(string key, bool more)
+        // SGDB's reported "total" can't be trusted (it's often exactly double), so
+        // find the real count: pages are full up to the last one, so binary-search
+        // for the last non-empty page - a few requests even for hundreds of assets.
+        // Probed pages land in the API cache, so "Load more" on them is instant.
+        async void CountAssets(AType t, int gameId, AssetPage first, int g)
+        {
+            int limit = first.Limit;
+            int lo = 0, loCount = first.Assets.Count;                 // last known non-empty page
+            int hi = Math.Max(1, (first.Total + limit - 1) / limit);  // past the end (total over-reports)
+            try
+            {
+                // in case the reported total ever under-reports, push hi until empty
+                while (true)
+                {
+                    AssetPage ph = await api.AssetsPaged(gameId, t, hi);
+                    if (g != gen) return;
+                    if (ph.Assets.Count == 0) break;
+                    lo = hi; loCount = ph.Assets.Count;
+                    if (loCount < limit) { hi = lo + 1; break; }
+                    hi *= 2;
+                }
+                while (hi - lo > 1 && loCount >= limit)
+                {
+                    int mid = (lo + hi) / 2;
+                    AssetPage pm = await api.AssetsPaged(gameId, t, mid);
+                    if (g != gen) return;
+                    if (pm.Assets.Count == 0) hi = mid;
+                    else { lo = mid; loCount = pm.Assets.Count; }
+                }
+            }
+            catch (Exception) { return; }   // couldn't count - paging still works by page fullness
+            if (g != gen || !exactByType.ContainsKey(t.Key)) return;
+            exactByType[t.Key] = lo * limit + loCount;
+            UpdateCountLabel(t.Key);
+            Label ml;
+            if (loadMoreLabels.TryGetValue(t.Key, out ml) && !ml.IsDisposed) ml.Text = LoadMoreText(t.Key);
+        }
+
+        string LoadMoreText(string key)
+        {
+            int ex, shown;
+            if (exactByType.TryGetValue(key, out ex) && ex >= 0 && shownByType.TryGetValue(key, out shown))
+                return "Load more\n(" + Math.Max(0, ex - shown) + " left)";
+            return "Load more";
+        }
+
+        void UpdateCountLabel(string key)
         {
             Label l;
             if (!countLabels.TryGetValue(key, out l)) return;
-            int n = shownByType[key];
+            int n = shownByType[key], ex;
+            if (!exactByType.TryGetValue(key, out ex)) ex = -1;
             l.Text = n == 0 ? "none available on SteamGridDB"
-                   : more ? n + " loaded, more available - click to stage a change"
-                   : n + " available - click to stage a change";
+                   : ex >= 0 && n >= ex ? n + " available - click to stage a change"
+                   : ex >= 0 ? n + " of " + ex + " loaded - click to stage a change"
+                   : n + " loaded, counting the rest... - click to stage a change";
         }
 
         // ---------------------------------------------- animated previews
